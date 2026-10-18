@@ -4,6 +4,15 @@ The first meaningful line must follow the project format, or be a git-made
 ``Merge …`` / ``Revert "…"`` line. Every line is then checked for AI trailers,
 ``claude.ai`` URLs, local home paths, non-allowlisted e-mails and private
 markers. Secret-shaped content in messages is gitleaks' job (``gitleaks stdin``).
+
+One exact line is exempt from ``msg-email``: Dependabot's standard sign-off
+trailer, :data:`DEPENDABOT_SIGNOFF`. The whole line, after line splitting, must
+be equal, so the same address anywhere else, another name, another address or any
+trailing text is still a finding. The commit author is deliberately not
+checked: the line names only GitHub's public bot address, so a forged author
+gains nothing but that one harmless line, while squash or local rebases of a
+Dependabot change would lose the exemption. The address is assembled from
+fragments so that this file holds no e-mail-shaped literal.
 """
 
 from __future__ import annotations
@@ -28,6 +37,7 @@ GIT_MADE_RE = re.compile(r'^(Merge |Revert ")')
 COAUTHOR_RE = re.compile(r"(?i)^\s*co-authored-by:.*@([a-z0-9-]+\.)*anthropic\.com\b")
 SESSION_RE = re.compile(r"(?i)^\s*claude-session:")
 LOCAL_PATH_RE = re.compile(r"(?:/Users|/home)/[^/\s]+/")
+DEPENDABOT_SIGNOFF = "Signed-off-by: dependabot[bot] <" + "support" + "@" + "github.com" + ">"
 
 
 def first_line_index(lines: list[str]) -> int | None:
@@ -71,7 +81,7 @@ def check_message(
             add("msg-claude-url", no)
         if LOCAL_PATH_RE.search(line):
             add("msg-local-path", no)
-        if disallowed_email_in(line):
+        if line != DEPENDABOT_SIGNOFF and disallowed_email_in(line):
             add("msg-email", no)
         if markers.any_hit(line):
             add("msg-private-marker", no)

@@ -193,3 +193,38 @@ def test_prepush_malformed_stdin_is_rc2(tmp_path: Path) -> None:
 def test_prepush_empty_stdin_is_clean(tmp_path: Path) -> None:
     repo, _ = _repo_with_remote(tmp_path)
     assert _prepush(repo, []).rc == 0
+
+
+# --------------------------------------------------------------------------- Dependabot sign-off
+
+BOT_SIGNOFF = "Signed-off-by: dependabot[bot] <" + email("support", "github.com") + ">\n"
+
+
+@pytest.mark.gitleaks
+def test_dependabot_signoff_consistent_across_modes(tmp_path: Path) -> None:
+    """The exact trailer is clean in message, range, prepush and history; a variant is flagged in all four."""
+    require_gitleaks()
+    repo, base = _repo_with_remote(tmp_path)
+    good_msg = msg("bump x") + BOT_SIGNOFF
+    bad_msg = msg("bump y") + "Signed-off-by: dependabot[bot] <" + email("support", "gmail.com") + ">\n"
+
+    repo.write(".git/GOOD", good_msg)
+    repo.write(".git/BAD", bad_msg)
+    assert repo.guards("message", ".git/GOOD").rc == 0
+    bad = repo.guards("message", ".git/BAD")
+    assert bad.rc == 1 and bad.findings == [("msg-email", ":message", "6")]
+
+    repo.git("checkout", "-q", "-b", "deps")
+    good = repo.commit(good_msg)
+    assert repo.guards("range", "origin", base, "HEAD").rc == 0
+    assert _prepush(repo, [f"refs/heads/deps {good} refs/heads/deps {ZERO}"]).rc == 0
+    assert repo.guards("history").rc == 0
+
+    flagged = repo.commit(bad_msg)
+    for res in (
+        repo.guards("range", "origin", base, "HEAD"),
+        _prepush(repo, [f"refs/heads/deps {flagged} refs/heads/deps {ZERO}"]),
+        repo.guards("history"),
+    ):
+        assert res.rc == 1
+        assert res.findings == [("msg-email", ":message", "6", flagged)]

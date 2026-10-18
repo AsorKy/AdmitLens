@@ -333,6 +333,59 @@ def test_message_leak_negative(body: str) -> None:
     assert messages.check_message(GOOD + body, ":message", NO_MARKERS) == []
 
 
+# Dependabot's standard sign-off (GitHub's public bot address), built at runtime.
+BOT_ADDR = email("support", "github.com")
+SIGNOFF = "Signed-off-by: dependabot[bot] <" + BOT_ADDR + ">"
+
+
+def test_dependabot_signoff_constant_matches() -> None:
+    assert messages.DEPENDABOT_SIGNOFF == SIGNOFF
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        SIGNOFF + "\n",
+        "Bumps x from 1 to 2.\n\n---\nupdated-dependencies:\n- dependency-name: x\n...\n\n" + SIGNOFF + "\n",
+        SIGNOFF,  # no trailing newline
+        SIGNOFF + "\r\n",  # CRLF: splitlines drops the terminator
+    ],
+)
+def test_dependabot_signoff_exempt(body: str) -> None:
+    assert messages.check_message(GOOD + body, ":message", NO_MARKERS) == []
+
+
+@pytest.mark.parametrize(
+    ("body", "line"),
+    [
+        ("contact " + BOT_ADDR + "\n", 3),  # same address, another line
+        ("x\n" + SIGNOFF + "\ncc " + BOT_ADDR + "\n", 5),  # exempt line, then the address in the body
+        ("Signed-off-by: dependabot[bot] <" + email("support", "gmail.com") + ">\n", 3),
+        ("Signed-off-by: dependabot[bot] <" + email("dependabot", "github.com") + ">\n", 3),
+        ("Signed-off-by: Some Dev <" + email("some.dev", "gmail.com") + ">\n", 3),
+        ("Signed-off-by: dependabot <" + BOT_ADDR + ">\n", 3),  # name not exact
+        ("signed-off-by: dependabot[bot] <" + BOT_ADDR + ">\n", 3),  # case differs
+        (SIGNOFF + " " + email("x", "gmail.com") + "\n", 3),  # trailing text
+        (SIGNOFF + " and more\n", 3),  # trailing text, no second address
+        (SIGNOFF + " \n", 3),  # trailing space
+        (" " + SIGNOFF + "\n", 3),  # leading space
+        ("> " + SIGNOFF + "\n", 3),  # quoted
+    ],
+)
+def test_dependabot_signoff_not_exempt(body: str, line: int) -> None:
+    found = messages.check_message(GOOD + body, ":message", NO_MARKERS)
+    assert ("msg-email", ":message", line) in _rpl(found)
+    assert {f.rule for f in found} == {"msg-email"}
+
+
+def test_dependabot_signoff_does_not_mask_other_rules() -> None:
+    markers, values = _markers()
+    found = messages.check_message(GOOD + SIGNOFF + "\n", ":message", markers)
+    assert found == []
+    found = messages.check_message(GOOD + "by " + values[0] + "\n" + SIGNOFF + "\n", ":message", markers)
+    assert _rpl(found) == [("msg-private-marker", ":message", 3)]
+
+
 def test_message_private_marker() -> None:
     markers, values = _markers()
     found = messages.check_message(GOOD + "by " + values[0] + "\n", ":message", markers)

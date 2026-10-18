@@ -5,7 +5,11 @@
 * ``.gitignore``: the only negation allowed is ``!.env.example``.
 * Workflows: ``run:`` is ``make`` only, ``uses:`` pinned to a 40-hex SHA,
   top-level ``permissions:``, no ``pull_request_target``/``workflow_run``,
-  no ``${{ github.event.`` in ``run:``, and ``guards.yml`` has no paths filter.
+  no ``${{ github.event.`` in ``run:``, ``guards.yml`` has no paths filter,
+  no floating ``*-latest`` runner label (``wf-runner-latest``) and no
+  ``runs-on:`` expression other than a bare ``${{ matrix.<key> }}``
+  (``wf-runner-dynamic``): the image must not change under the pinned
+  toolchain (Make, git), and a computed label cannot be checked statically.
 * ``.gitattributes``: ``-diff``/``binary``/``diff=`` only on a closed list of
   binary extensions, and no ``[attr]`` macros (they hide diffs from reviewers
   and from any diff-based scanner).
@@ -133,6 +137,9 @@ MAKE_SEGMENT_RE = re.compile(r"^make(\s+[A-Za-z0-9_.,/=:@+%-]+)*$")
 FORBIDDEN_TRIGGERS = frozenset({"pull_request_target", "workflow_run"})
 EVENT_RE = re.compile(r"\$\{\{\s*github\.event\.")
 GUARDS_WORKFLOWS = frozenset({"guards.yml", "guards.yaml"})
+LATEST_RUNNER_RE = re.compile(r"(?i)-latest\b")
+EXPRESSION_RE = re.compile(r"\$\{\{")
+MATRIX_REF_RE = re.compile(r"^\$\{\{\s*matrix\.([A-Za-z0-9_-]+)\s*\}\}$")
 
 
 def is_workflow(path: str) -> bool:
@@ -170,6 +177,77 @@ def _trigger_nodes(on_value: yaml.Node) -> list[tuple[str, yaml.Node, yaml.Node 
     if isinstance(on_value, yaml.MappingNode):
         return [(k.value, k, v) for k, v in on_value.value if isinstance(k, yaml.ScalarNode)]
     return []
+
+
+def _scalars(node: yaml.Node) -> list[yaml.ScalarNode]:
+    """Every scalar under ``node``, keys excluded."""
+    if isinstance(node, yaml.ScalarNode):
+        return [node]
+    if isinstance(node, yaml.SequenceNode):
+        return [s for item in node.value for s in _scalars(item)]
+    if isinstance(node, yaml.MappingNode):
+        return [s for _k, v in node.value for s in _scalars(v)]
+    return []
+
+
+def _mapping_get(node: yaml.Node | None, name: str) -> yaml.Node | None:
+    if isinstance(node, yaml.MappingNode):
+        for k, v in node.value:
+            if _scalar(k) == name:
+                return v
+    return None
+
+
+def _runner_labels(runs_on: yaml.Node) -> list[yaml.ScalarNode]:
+    """Label scalars of ``runs-on``: a string, a list, or the ``labels`` of a mapping (``group`` is a name, not a label)."""
+    if isinstance(runs_on, yaml.MappingNode):
+        labels = _mapping_get(runs_on, "labels")
+        return _scalars(labels) if labels is not None else []
+    return _scalars(runs_on)
+
+
+def _check_runners(jobs: yaml.Node, add) -> None:  # noqa: ANN001
+    """``runs-on`` of each job, plus the matrix keys it references as ``${{ matrix.<key> }}``."""
+    if not isinstance(jobs, yaml.MappingNode):
+        return
+    for _name, job in jobs.value:
+        runs_on = _mapping_get(job, "runs-on")
+        if runs_on is None:
+            continue
+        keys: set[str] = set()
+        for s in _runner_labels(runs_on):
+            ref = MATRIX_REF_RE.match(s.value.strip())
+            if ref:
+                keys.add(ref.group(1))
+            elif EXPRESSION_RE.search(s.value):
+                add("wf-runner-dynamic", _line(s))
+            elif LATEST_RUNNER_RE.search(s.value):
+                add("wf-runner-latest", _line(s))
+        matrix = _mapping_get(_mapping_get(job, "strategy"), "matrix")
+        if not keys or matrix is None:
+            continue
+        if not isinstance(matrix, yaml.MappingNode):  # e.g. ${{ fromJSON(...) }}: cannot be checked
+            add("wf-runner-dynamic", _line(matrix))
+            continue
+        values: list[yaml.ScalarNode] = []
+        for key in sorted(keys):
+            node = _mapping_get(matrix, key)
+            if node is not None:
+                values += _scalars(node)
+        include = _mapping_get(matrix, "include")
+        if isinstance(include, yaml.SequenceNode):
+            for entry in include.value:
+                for key in sorted(keys):
+                    node = _mapping_get(entry, key)
+                    if node is not None:
+                        values += _scalars(node)
+        elif include is not None:
+            add("wf-runner-dynamic", _line(include))
+        for s in values:
+            if EXPRESSION_RE.search(s.value):
+                add("wf-runner-dynamic", _line(s))
+            elif LATEST_RUNNER_RE.search(s.value):
+                add("wf-runner-latest", _line(s))
 
 
 def _walk(node: yaml.Node, add) -> None:  # noqa: ANN001
@@ -221,6 +299,7 @@ def check_workflow(path: str, text: str, disabled: Disabled = NONE_DISABLED) -> 
                         add("wf-guards-paths", _line(k))
     if "jobs" in top:
         _walk(top["jobs"][1], add)
+        _check_runners(top["jobs"][1], add)
     return found
 
 

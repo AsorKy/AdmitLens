@@ -92,6 +92,27 @@ def test_checkout_does_not_persist_credentials(path):
             assert step.get("with", {}).get("persist-credentials") is False
 
 
+@pytest.mark.parametrize("path", WORKFLOWS, ids=IDS)
+def test_runners_are_pinned(path):
+    """No floating `*-latest` label: the image (Make, git) must not change under CI."""
+    for name, job in load(path)["jobs"].items():
+        if "uses" in job:  # reusable-workflow call: no runner of its own
+            continue
+        labels = job.get("runs-on")
+        assert labels, name
+        if isinstance(labels, dict):  # {group, labels}: flatten both
+            inner = labels.get("labels", [])
+            labels = [labels.get("group"), *([inner] if isinstance(inner, str) else inner)]
+        elif isinstance(labels, str):
+            labels = [labels]
+        assert all("-latest" not in str(lbl).lower() and "${{" not in str(lbl) for lbl in labels), name
+
+
+def test_guards_runs_on_ubuntu_24_04():
+    (job,) = load(REPO_ROOT / ".github" / "workflows" / "guards.yml")["jobs"].values()
+    assert job["runs-on"] == "ubuntu-24.04"
+
+
 def test_guards_has_no_paths_filter():
     wf = load(REPO_ROOT / ".github" / "workflows" / "guards.yml")
     for name, cfg in triggers(wf).items():
@@ -147,7 +168,7 @@ on:
 permissions: {{}}
 jobs:
   j:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -195,6 +216,80 @@ def test_negative_guards_paths(key):
     text = BASE.format(steps=OK_STEP).replace("  push:", f"  push:\n    {key}: ['a/**']")
     assert "wf-guards-paths" in lint_text("guards.yml", text)
     assert "wf-guards-paths" not in lint_text("other.yml", text)
+
+
+RUNNER = "    runs-on: ubuntu-24.04\n"
+
+
+@pytest.mark.parametrize(
+    "runs_on",
+    [
+        "    runs-on: ubuntu-latest\n",
+        "    runs-on: Ubuntu-Latest\n",
+        "    runs-on: windows-latest\n",
+        "    runs-on: macos-latest\n",
+        "    runs-on: [self-hosted, ubuntu-latest]\n",
+        "    runs-on:\n      - ubuntu-latest\n",
+        "    runs-on:\n      group: g\n      labels: [ubuntu-latest]\n",
+        "    strategy:\n      matrix:\n        os: [ubuntu-24.04, macos-latest]\n    runs-on: ${{ matrix.os }}\n",
+        "    strategy:\n      matrix:\n        include:\n          - os: ubuntu-latest\n    runs-on: ${{ matrix.os }}\n",
+    ],
+)
+def test_negative_runner_latest(runs_on):
+    text = BASE.format(steps=OK_STEP).replace(RUNNER, runs_on)
+    assert text != BASE.format(steps=OK_STEP)
+    assert "wf-runner-latest" in lint_text("guards.yml", text)
+    assert "wf-runner-latest" in lint_text("other.yml", text)
+
+
+@pytest.mark.parametrize(
+    "runs_on",
+    [
+        "    runs-on: ubuntu-24.04\n",
+        "    runs-on: [self-hosted, linux]\n",
+        "    strategy:\n      matrix:\n        os: [ubuntu-24.04, macos-15]\n    runs-on: ${{ matrix.os }}\n",
+        "    strategy:\n      matrix:\n        os: [ubuntu-24.04]\n    runs-on: ${{matrix.os}}\n",
+        "    runs-on:\n      group: my-latest-pool\n",
+        "    runs-on:\n      group: my-latest-pool\n      labels: [linux-x64]\n",
+        # a matrix key that runs-on does not reference is not a runner label
+        "    strategy:\n      matrix:\n        image: [postgres-latest]\n    runs-on: ubuntu-24.04\n",
+        "    strategy:\n      matrix:\n        os: [ubuntu-24.04]\n        include:\n          - image: postgres-latest\n"
+        "    runs-on: ${{ matrix.os }}\n",
+    ],
+)
+def test_runner_pinned_is_clean(runs_on):
+    text = BASE.format(steps=OK_STEP).replace(RUNNER, runs_on)
+    assert text != BASE.format(steps=OK_STEP) or runs_on == RUNNER
+    rules = lint_text("guards.yml", text)
+    assert not {"wf-runner-latest", "wf-runner-dynamic"} & rules, rules
+
+
+@pytest.mark.parametrize(
+    "runs_on",
+    [
+        "    runs-on: ${{ vars.RUNNER }}\n",
+        "    runs-on: ${{ inputs.os }}\n",
+        "    runs-on: ${{ format('ubuntu-{0}', 'latest') }}\n",
+        "    runs-on: ${{ fromJSON(needs.x.outputs.os) }}\n",
+        "    runs-on: [self-hosted, '${{ vars.RUNNER }}']\n",
+        "    runs-on:\n      group: g\n      labels: ['${{ inputs.os }}']\n",
+        "    runs-on: ${{ matrix.os }}-x\n",  # not exactly a matrix reference
+        "    runs-on: ${{ matrix.os || 'ubuntu-latest' }}\n",
+        "    strategy:\n      matrix:\n        os: ${{ fromJSON(vars.OSES) }}\n    runs-on: ${{ matrix.os }}\n",
+        "    strategy:\n      matrix: ${{ fromJSON(vars.M) }}\n    runs-on: ${{ matrix.os }}\n",
+        "    strategy:\n      matrix:\n        include:\n          - os: ${{ vars.OS }}\n    runs-on: ${{ matrix.os }}\n",
+    ],
+)
+def test_negative_runner_dynamic(runs_on):
+    text = BASE.format(steps=OK_STEP).replace(RUNNER, runs_on)
+    assert "wf-runner-dynamic" in lint_text("guards.yml", text)
+    assert "wf-runner-dynamic" in lint_text("other.yml", text)
+
+
+def test_negative_runner_latest_line_number():
+    text = BASE.format(steps=OK_STEP).replace(RUNNER, "    runs-on: ubuntu-latest\n")
+    found = [f for f in lint.check_workflow(".github/workflows/guards.yml", text) if f.rule == "wf-runner-latest"]
+    assert [f.line for f in found] == [7]
 
 
 def test_negative_invalid_yaml():
