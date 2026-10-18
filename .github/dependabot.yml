@@ -18,5 +18,16 @@ updates:
       default-days: 7
     open-pull-requests-limit: 5
     groups:
-      uv:
+      uv-guards:
         patterns: ["*"]
+  - package-ecosystem: uv
+    directory: /level-1/backend
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    groups:
+      uv-level-1:
+        patterns: ["*"]
+        update-types: [minor, patch]

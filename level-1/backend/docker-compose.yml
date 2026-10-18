@@ -1,0 +1,35 @@
+# Level 1 runs only its database in Docker; the app runs on the host (ADR-0010 §2.1).
+# Values come from .env (create it with `make env`). Inspect with `docker compose config -q`
+# only: without -q the rendered file shows the password.
+name: admitlens-l1
+
+services:
+  db:
+    # 16.15-bookworm, pinned to its multi-arch index digest. Bump tag and digest together.
+    image: postgres:16.15-bookworm@sha256:0ea6700a3b4f0ae6ce746519073558aed4d88a79d8d07622a9a644946c7319c4
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-admitlens}
+      POSTGRES_DB: ${POSTGRES_DB:-admitlens}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is not set; run make env}
+      TZ: UTC
+    # Every session starts in UTC (ADR-0010 §2.2). terse drops DETAIL, HINT and CONTEXT
+    # (which can echo row values) from the server log; STATEMENT lines are still logged.
+    command: ["postgres", "-c", "timezone=UTC", "-c", "log_error_verbosity=terse"]
+    ports:
+      - "127.0.0.1:${ADMITLENS_DB_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # SQL that `make db-up` applies (ensure-test-db.sql). Not an init dir: nothing runs on its own.
+      - ./ops/postgres:/opt/admitlens/postgres:ro
+    healthcheck:
+      # Over TCP, so the temporary socket-only server of the first init never counts as healthy.
+      test: ["CMD-SHELL", "pg_isready -q -h 127.0.0.1 -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+    stop_grace_period: 30s
+    restart: "no"
+
+volumes:
+  pgdata:

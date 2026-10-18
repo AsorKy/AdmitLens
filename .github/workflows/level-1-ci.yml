@@ -1,0 +1,72 @@
+name: level-1-ci
+
+on:
+  push:
+    paths:
+      - "level-1/**"
+      - ".github/workflows/level-1-ci.yml"
+  pull_request:
+    paths:
+      - "level-1/**"
+      - ".github/workflows/level-1-ci.yml"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: level-1-ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # Lint only: `make typecheck` is informational and stays out of CI (PLAN-CA-0005 Q9).
+  static:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: "0.11.2"
+          enable-cache: true
+          cache-dependency-glob: level-1/backend/uv.lock
+      - run: make -C level-1/backend lint
+
+  # Tests that need no database. The integration job (with a Postgres service) arrives in L1-P2.
+  unit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: "0.11.2"
+          enable-cache: true
+          cache-dependency-glob: level-1/backend/uv.lock
+      - run: make -C level-1/backend test-unit
+
+  # ADR-0007 §2.4: every level workflow scans for leaks, over the full history.
+  secrets:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: "0.11.2"
+          enable-cache: true
+          cache-dependency-glob: tools/guards/uv.lock
+      - run: make setup
+      - run: make secrets-scan

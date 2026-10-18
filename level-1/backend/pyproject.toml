@@ -1,0 +1,70 @@
+[project]
+name = "admitlens-level-1-backend"
+version = "0.1.0"
+description = "AdmitLens level 1: synchronous FastAPI monolith on PostgreSQL 16."
+requires-python = ">=3.12,<3.13"
+# Runtime: ADR-0001 §2.3.1, plus the PostgreSQL driver and zone data of ADR-0010.
+# pandas 3 and SQLAlchemy 2.1 accepted by decision D-0016; majors arrive as separate PRs.
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "pydantic>=2",
+    "pydantic-settings>=2",
+    "sqlalchemy>=2.1,<2.2",
+    "alembic",
+    "pandas>=3.0,<4",
+    "numpy>=2,<3",
+    "python-multipart",
+    "psycopg[binary]>=3",
+    "tzdata",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-cov",
+    "httpx",
+    "ruff",
+    "mypy",
+    "pyyaml",
+    "types-pyyaml",
+]
+
+[tool.uv]
+# An application, not a library: uv installs the dependencies only.
+package = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+# Migrations are formatted once by hand and then left alone (PLAN-CA-0006 W2).
+extend-exclude = ["alembic/versions"]
+
+[tool.ruff.lint]
+# E F I B UP SIM: ADR-0001 §2.3.1. DTZ: ADR-0010 (aware datetimes only). S: bandit rules.
+select = ["E", "F", "I", "B", "UP", "SIM", "DTZ", "S"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests may assert and use obvious fake credentials.
+"tests/**" = ["S101", "S105", "S106"]
+# Tooling tests drive make, docker and sh with fixed argument lists, never with
+# untrusted input; executables are resolved to absolute paths first.
+"tests/tooling/**" = ["S101", "S105", "S106", "S603"]
+
+[tool.mypy]
+# Informational only: `make typecheck` is outside `check` and CI (PLAN-CA-0005 Q9).
+python_version = "3.12"
+warn_unused_configs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q --strict-markers"
+filterwarnings = ["error"]
+markers = [
+    "commits: makes real commits and truncates afterwards (at most 5 tests)",
+    "perf: query-count and timing budgets",
+    "seed: loads the seed CSVs",
+    "tooling: checks the level tooling (make, compose, make env); no database",
+    "docker: needs the database from `make db-up`; excluded from `make test-unit`",
+]

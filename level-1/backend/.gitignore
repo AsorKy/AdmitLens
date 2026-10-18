@@ -1,0 +1,54 @@
+# level-1/backend .gitignore: repeats the root's secret, Python and database groups,
+# so this folder stays safe on its own (I9). The ONLY negation allowed is !.env.example.
+
+# --- Secrets ---
+.env
+.env.*
+*.env
+!.env.example
+.envrc
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+id_rsa*
+id_ed25519*
+id_ecdsa*
+*.age
+.netrc
+.pgpass
+.npmrc
+.pypirc
+.git-credentials
+secrets/
+
+# --- Databases and dumps ---
+*.db
+*.sqlite*
+*.db-*
+*.dump
+# Dumps only: migrations and init scripts (*.sql) must stay trackable.
+dump*.sql
+*_dump.sql
+*.sql.gz
+*.sql.bz2
+*.sql.xz
+*.bak
+backups/
+pgdata/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage*
+coverage.xml
+htmlcov/
+coverage/
+junit*.xml
+*.egg-info/
+.hypothesis/
