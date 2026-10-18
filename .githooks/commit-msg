@@ -1,0 +1,5 @@
+#!/bin/sh
+# Thin hook: `make hook-commit-msg` checks the message; its path travels in the env, never as a make argument.
+command -v make >/dev/null 2>&1 || { echo "commit-msg: make not found; commit blocked" >&2; exit 2; }
+dir=$(CDPATH= cd -- "$(dirname -- "$1")" && pwd) && top=$(git rev-parse --show-toplevel) || exit 2
+MSG_FILE="$dir/$(basename -- "$1")" MAKEFILES= MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= exec make -s -C "$top" -f Makefile hook-commit-msg

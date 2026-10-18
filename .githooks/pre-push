@@ -1,0 +1,5 @@
+#!/bin/sh
+# Thin hook: `make hook-pre-push` reads the refs on stdin; the remote name travels in the env.
+command -v make >/dev/null 2>&1 || { echo "pre-push: make not found; push blocked" >&2; exit 2; }
+top=$(git rev-parse --show-toplevel) || exit 2
+REMOTE="$1" MAKEFILES= MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= exec make -s -C "$top" -f Makefile hook-pre-push

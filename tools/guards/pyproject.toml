@@ -1,0 +1,26 @@
+[project]
+name = "admitlens-guards"
+version = "0.1.0"
+description = "Leak-detection guards for the AdmitLens repository: paths, content, identity, commit messages and lint."
+requires-python = ">=3.12,<3.13"
+dependencies = ["pyyaml>=6"]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+addopts = "-ra --tb=short --strict-markers -p no:cacheprovider"
+testpaths = ["tests"]
+pythonpath = ["."]
+# Throwaway repos and scan copies add up to GBs: keep them only for failed tests, last run only.
+tmp_path_retention_policy = "failed"
+tmp_path_retention_count = 1
+markers = [
+    "unit: pure rule tests, no git and no subprocess",
+    "git: tests that build throwaway git repositories under tmp_path",
+    "gitleaks: tests that need the pinned gitleaks binary (fail, never skip, unless GUARDS_ALLOW_SKIP=1 outside CI)",
+    "make: tests that invoke make",
+]

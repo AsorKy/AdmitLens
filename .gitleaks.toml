@@ -1,0 +1,117 @@
+# AdmitLens gitleaks configuration (pinned binary: 8.30.1, see tools/guards/bin).
+#
+# Design rules:
+#   * Default rules stay active; the admitlens-* rules close the gaps measured in
+#     PLAN-CA-0005: DSN passwords, low-entropy passwords, SSN shape, local paths.
+#   * All patterns are RE2 (Go): no lookahead, so exclusions use alternation.
+#   * Suppressions are by VALUE only (placeholders). There are no path allowlists;
+#     the single per-file exception (.env.example) lives inside the path regex of
+#     admitlens-path-env.
+#   * Provider-token rules (Supabase, Railway, Vercel, Bright Data) arrive with L4.
+#   * Patterns avoid spelling their own targets literally (e.g. [s], [-], [ ]) so
+#     this file does not trigger its own rules.
+
+title = "AdmitLens gitleaks config"
+
+[extend]
+useDefault = true
+
+# ---------------------------------------------------------------------------
+# Global allowlist: placeholders, matched against the secret value only.
+# ---------------------------------------------------------------------------
+[[allowlists]]
+description = "Placeholder values (generated, required, interpolated or templated)"
+regexTarget = "secret"
+regexes = [
+  '''^__(?:GENERATE|REQUIRED)__$''',
+  '''^<''',
+  '''^\$\{''',
+  '''^\$\$?[A-Za-z_][A-Za-z0-9_]*$''',
+]
+
+# ---------------------------------------------------------------------------
+# Content rules
+# ---------------------------------------------------------------------------
+[[rules]]
+id = "admitlens-dsn-password"
+description = "Connection string with an inline password (scheme://user:password@)"
+regex = '''(?i)\b(?:postgres(?:ql)?(?:\+[a-z0-9_]+)?|rediss?|amqps?|mongodb(?:\+srv)?|mysql(?:\+[a-z0-9_]+)?)://[^\s:/@'"<>$]+:([^\s:/@'"<>${}]+)@'''
+secretGroup = 1
+keywords = ["postgres", "redis", "amqp", "mongodb", "mysql"]
+
+# Config-like files: NAME=value / NAME: value with a non-placeholder value.
+# The name must END with the sensitive word (so TOKEN_TTL=900 is not a hit).
+[[rules]]
+id = "admitlens-secret-assignment"
+description = "Sensitive-looking setting with a literal value in an env, YAML, TOML, INI, CFG or compose file"
+path = '''(?i)(?:^|/)(?:\.env(?:\.[^/]*)?|[^/]+\.ya?ml|[^/]+\.toml|[^/]+\.ini|[^/]+\.cfg|docker-compose[^/]*\.yml)$'''
+regex = '''(?i)(?:PASSWORD|PASSWD|SECRET|TOKEN|APIKEY|API_KEY|PRIVATE_KEY|DSN)["']?[ \t]*[=:][ \t]*["']?([^\s"'#]+)'''
+secretGroup = 1
+keywords = ["password", "passwd", "secret", "token", "apikey", "api_key", "private_key", "dsn"]
+
+  [[rules.allowlists]]
+  description = "Docker secret files and plain flags are not secret values"
+  regexTarget = "secret"
+  regexes = [
+    '''^/run/secrets/''',
+    '''(?i)^(?:true|false|null|none|~)$''',
+  ]
+
+# Python: only string literals assigned to a sensitive name. Reads such as
+# os.environ[...], settings.x or Field(...) never match because no quote follows '='.
+[[rules]]
+id = "admitlens-secret-assignment-py"
+description = "Python assignment of a string literal to a sensitive-looking name"
+path = '''\.py$'''
+regex = '''(?mi)^[ \t]*(?:self\.|cls\.)?[a-z0-9_]*(?:PASSWORD|PASSWD|SECRET|TOKEN|APIKEY|API_KEY|PRIVATE_KEY|DSN)[ \t]*(?::[^=\n]+)?=[ \t]*[rb]{0,2}["']([^"'\n]+)["']'''
+secretGroup = 1
+keywords = ["password", "passwd", "secret", "token", "apikey", "api_key", "private_key", "dsn"]
+
+# US SSN shape. Excludes area 000, 666 and 900-999, group 00 and serial 0000 by
+# alternation. ISO dates and 3-3-4 phone numbers do not fit the 3-2-4 shape.
+[[rules]]
+id = "admitlens-ssn"
+description = "US Social Security number shape (3-2-4 digits, valid ranges only)"
+regex = '''\b(?:00[1-9]|0[1-9]\d|[1-5]\d\d|6[0-5]\d|66[0-5]|66[7-9]|6[7-9]\d|[78]\d\d)-(?:0[1-9]|[1-9]\d)-(?:000[1-9]|00[1-9]\d|0[1-9]\d\d|[1-9]\d{3})\b'''
+
+[[rules]]
+id = "admitlens-local-path"
+description = "Developer-machine path, Claude project slug or temp directory"
+# No secretGroup on purpose: gitleaks then reports the first non-empty group (the user
+# name). The whole path would be swallowed by the default allowlist regex for /home/...
+regex = '''/Users/([A-Za-z0-9._-]+)/|/home/([A-Za-z0-9._-]+)/|[A-Za-z]:\\Users\\([^\\\s]+)\\|-Users-([A-Za-z0-9._]+)-|/private/tmp/claude[-]|/private/var/folder[s]/'''
+keywords = ["/users/", "/home/", "\\users\\", "-users-", "/private/"]
+
+  [[rules.allowlists]]
+  description = "GitHub Actions runner home directory"
+  regexTarget = "match"
+  regexes = ['''^/home/runner/$''']
+
+[[rules]]
+id = "admitlens-vault-marker"
+description = "Marker of the private notes vault"
+regex = '''(?:Obsidian[ ]Vault/|\[\[projects/)'''
+keywords = ["obsidian", "projects/"]
+
+# ---------------------------------------------------------------------------
+# Path-only rules (history scans). No regex: the file name alone is the finding.
+# ---------------------------------------------------------------------------
+[[rules]]
+id = "admitlens-path-env"
+description = "Environment file committed (only the exact name .env.example is allowed)"
+path = '''(?:^|/)\.env(?:\.(?:[^e/][^/]*|e(?:[^x/][^/]*)?|ex(?:[^a/][^/]*)?|exa(?:[^m/][^/]*)?|exam(?:[^p/][^/]*)?|examp(?:[^l/][^/]*)?|exampl(?:[^e/][^/]*)?|example[^/]+))?$'''
+
+[[rules]]
+id = "admitlens-path-data"
+description = "File under a data/ directory"
+path = '''(?:^|/)data/'''
+
+[[rules]]
+id = "admitlens-path-key"
+description = "Key or certificate bundle file"
+path = '''(?i)(?:^|/)(?:[^/]+\.(?:pem|key|p12|pfx)|id_rsa[^/]*|id_ed25519[^/]*)$'''
+
+[[rules]]
+id = "admitlens-path-db"
+description = "Database file or dump"
+path = '''(?i)\.(?:db(?:-[^/]*)?|sqlite[^/]*)$'''

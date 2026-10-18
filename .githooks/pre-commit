@@ -1,0 +1,5 @@
+#!/bin/sh
+# Thin hook: all logic lives in `make hook-pre-commit` (tools/guards). Fails closed without make.
+command -v make >/dev/null 2>&1 || { echo "pre-commit: make not found; commit blocked" >&2; exit 2; }
+top=$(git rev-parse --show-toplevel) || exit 2
+MAKEFILES= MAKEFLAGS= MFLAGS= GNUMAKEFLAGS= exec make -s -C "$top" -f Makefile hook-pre-commit
