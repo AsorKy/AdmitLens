@@ -18,13 +18,19 @@ own git output:
 * pathspec-magic variables (``GIT_LITERAL_PATHSPECS`` and friends) are dropped,
   so path arguments mean exactly what the guards wrote;
 * ``GIT_TERMINAL_PROMPT=0``: a network call (``ls-remote``) never prompts.
+
+Every git process runs in its own session (process group). On a timeout or an
+interrupt the whole group is killed, so a transport child (``ssh``, a remote
+helper) spawned by ``ls-remote`` is never left running.
 """
 
 from __future__ import annotations
 
 import os
 import re
+import signal
 import subprocess
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -34,7 +40,9 @@ TIMEOUT = 30
 BATCH_TIMEOUT = 300
 ZERO_SHA_RE = re.compile(r"^0{40}$|^0{64}$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$|^[0-9a-f]{64}$")
-REMOTE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+# A remote *name* (never a URL): starts with an alphanumeric, may contain "/"
+# (``team/fork``), never "..", "//", whitespace, ":" or a trailing "/".
+REMOTE_NAME_RE = re.compile(r"^(?!.*\.\.)(?!.*//)[A-Za-z0-9][A-Za-z0-9._/-]*(?<!/)$")
 
 GITLINK_MODE = "160000"
 SYMLINK_MODE = "120000"
@@ -80,22 +88,44 @@ def git_env(base: dict[str, str] | None = None) -> dict[str, str]:
     return env
 
 
+def _subcommand(args: list[str]) -> str:
+    """The git subcommand in ``args`` (skipping ``-c key=value`` pairs), for error messages."""
+    i = 0
+    while i < len(args) and args[i].startswith("-"):
+        i += 2 if args[i] == "-c" else 1
+    return args[i] if i < len(args) else "command"
+
+
+def _kill_group(proc: subprocess.Popen[bytes]) -> None:
+    """Kill ``proc``'s whole process group (its own session) and reap it."""
+    with suppress(ProcessLookupError, PermissionError):
+        os.killpg(proc.pid, signal.SIGKILL)
+    with suppress(subprocess.TimeoutExpired, OSError, ValueError):
+        proc.communicate(timeout=5)
+
+
 def _run(args: list[str], cwd: Path, input: bytes | None, timeout: int) -> subprocess.CompletedProcess[bytes]:  # noqa: A002
     try:
-        return subprocess.run(  # noqa: S603
+        proc = subprocess.Popen(  # noqa: S603
             ["git", *args],  # noqa: S607
             cwd=cwd,
             env=git_env(),
-            input=input,
-            stdin=None if input is not None else subprocess.DEVNULL,
-            capture_output=True,
-            timeout=timeout,
-            check=False,
+            stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
         )
     except FileNotFoundError:
         raise GuardError("git is not installed") from None
+    try:
+        out, err = proc.communicate(input, timeout=timeout)
     except subprocess.TimeoutExpired:
-        raise GuardError(f"git {args[0]} timed out") from None
+        _kill_group(proc)
+        raise GuardError(f"git {_subcommand(args)} timed out after {timeout} s") from None
+    except BaseException:
+        _kill_group(proc)
+        raise
+    return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
 
 
 def git(args: list[str], cwd: Path, *, input: bytes | None = None, check: bool = True) -> bytes:  # noqa: A002
@@ -148,16 +178,10 @@ def resolve_commit(rev: str, cwd: Path) -> str:
 
 
 def resolve_ref(ref: str, cwd: Path) -> str | None:
-    """Commit a full ref name points at, or None when the ref does not exist."""
-    if not git_ok(["rev-parse", "--verify", "--quiet", "--end-of-options", f"{ref}^{{commit}}"], cwd):
-        return None
-    return git(["rev-parse", "--verify", "--quiet", "--end-of-options", f"{ref}^{{commit}}"], cwd).decode().strip()
-
-
-def merge_base(a: str, b: str, cwd: Path) -> str | None:
-    if not git_ok(["merge-base", a, b], cwd):
-        return None
-    return git(["merge-base", a, b], cwd).decode().strip() or None
+    """Commit a full ref name points at, or None when the ref does not exist (one git call)."""
+    proc = _run(["rev-parse", "--verify", "--quiet", "--end-of-options", f"{ref}^{{commit}}"], cwd, None, TIMEOUT)
+    sha = proc.stdout.decode("ascii", "replace").strip()
+    return sha if proc.returncode == 0 and SHA_RE.match(sha) else None
 
 
 def has_object(sha: str, cwd: Path) -> bool:
@@ -176,13 +200,27 @@ def rev_list(args: list[str], cwd: Path) -> list[str]:
 
 
 def blob(spec: str, cwd: Path) -> bytes | None:
-    """Content of ``<rev>:<path>`` or ``:<path>``; None if it is not a blob."""
-    if not git_ok(["cat-file", "-e", spec], cwd):
+    """Content of ``<rev>:<path>`` or ``:<path>``; None if it is missing or not a blob.
+
+    One ``cat-file --batch`` call: the header names the type and size.
+    """
+    if "\n" in spec or "\0" in spec:
+        raise GuardError("invalid object name")
+    proc = _run(["cat-file", "--batch"], cwd, spec.encode("utf-8", "surrogateescape") + b"\n", TIMEOUT)
+    if proc.returncode != 0:
+        raise GuardError(f"git cat-file failed (rc {proc.returncode})")
+    data = proc.stdout
+    nl = data.find(b"\n")
+    header = data[:nl].decode("ascii", "replace").split() if nl >= 0 else []
+    if len(header) != 3 or not SHA_RE.match(header[0]):
+        return None  # "<spec> missing" (or ambiguous): no such object
+    if header[1] != "blob":
         return None
-    kind = git(["cat-file", "-t", spec], cwd).decode().strip()
-    if kind != "blob":
-        return None
-    return git(["cat-file", "blob", spec], cwd)
+    size = int(header[2])
+    body = data[nl + 1 : nl + 1 + size]
+    if len(body) != size:
+        raise GuardError("unexpected git cat-file output")
+    return body
 
 
 @dataclass(frozen=True)
@@ -242,6 +280,89 @@ def read_blobs(shas: list[str], cwd: Path) -> dict[str, bytes]:
         start = nl + 1
         out[sha] = data[start : start + size]
         pos = start + size + 1
+    return out
+
+
+@dataclass(frozen=True)
+class CommitInfo:
+    """Identity and message of one commit, as ``git log`` formats them (re-encoded to UTF-8)."""
+
+    sha: str
+    author_name: str
+    author_email: str
+    committer_name: str
+    committer_email: str
+    message: bytes  # ``%B`` plus the newline ``git log -1 --format=%B`` ends with
+
+
+COMMIT_FIELDS = 6
+
+
+def commit_infos(shas: list[str], cwd: Path) -> dict[str, CommitInfo]:
+    """``CommitInfo`` for every commit in ``shas`` through one ``git log --no-walk --stdin -z``."""
+    unique = list(dict.fromkeys(shas))
+    if not unique:
+        return {}
+    for sha in unique:
+        if not SHA_RE.match(sha):
+            raise GuardError("invalid commit id")
+    args = ["log", "--no-walk=unsorted", "--stdin", "-z", "--format=%H%x00%an%x00%ae%x00%cn%x00%ce%x00%B"]
+    proc = _run(args, cwd, "".join(s + "\n" for s in unique).encode(), BATCH_TIMEOUT)
+    if proc.returncode != 0:
+        raise GuardError(f"git log failed (rc {proc.returncode})")
+    # -z terminates every record with NUL (in place of the newline -1 --format=%B ends with).
+    fields = proc.stdout.split(b"\0")
+    if len(fields) != COMMIT_FIELDS * len(unique) + 1 or fields[-1] != b"":
+        raise GuardError("unexpected git log output")
+    out: dict[str, CommitInfo] = {}
+    for i, sha in enumerate(unique):
+        rec = fields[i * COMMIT_FIELDS : (i + 1) * COMMIT_FIELDS]
+        if rec[0].decode("ascii", "replace") != sha:
+            raise GuardError("unexpected git log output")
+        an, ae, cn, ce = (f.decode("utf-8", "replace") for f in rec[1:5])
+        out[sha] = CommitInfo(sha, an, ae, cn, ce, rec[5] + b"\n")
+    return out
+
+
+def changed_entries(shas: list[str], cwd: Path) -> dict[str, list[Entry]]:
+    """Added or modified entries of each commit against each parent (merges via ``-m``).
+
+    One ``git diff-tree --stdin`` call for every commit. A commit with no
+    change has no output and maps to ``[]``. In ``-z`` output a token that
+    starts with ``:`` is an entry (its path is the next token); any other
+    token where an entry may start is the next commit's id.
+    """
+    unique = list(dict.fromkeys(shas))
+    out: dict[str, list[Entry]] = {sha: [] for sha in unique}
+    if not unique:
+        return out
+    for sha in unique:
+        if not SHA_RE.match(sha):
+            raise GuardError("invalid commit id")
+    args = ["diff-tree", "--stdin", "-m", "-r", "--root", "--raw", "-z", "--no-abbrev",
+            "--no-renames", "--no-ext-diff", "--diff-filter=d"]  # fmt: skip
+    proc = _run(args, cwd, "".join(s + "\n" for s in unique).encode(), BATCH_TIMEOUT)
+    if proc.returncode != 0:
+        raise GuardError(f"git diff-tree failed (rc {proc.returncode})")
+    fields = proc.stdout.split(b"\0")
+    current: str | None = None
+    i = 0
+    while i < len(fields):
+        tok = fields[i]
+        if not tok:
+            i += 1
+            continue
+        if tok.startswith(b":"):
+            if current is None or i + 1 >= len(fields):
+                raise GuardError("unexpected git diff-tree output")
+            out[current].extend(parse_raw_z(tok + b"\0" + fields[i + 1] + b"\0"))
+            i += 2
+            continue
+        sha = tok.decode("ascii", "replace")
+        if sha not in out:
+            raise GuardError("unexpected git diff-tree output")
+        current = sha
+        i += 1
     return out
 
 
@@ -315,17 +436,38 @@ def ref_tips(cwd: Path) -> list[str]:
     return list(dict.fromkeys(tips))
 
 
-def remote_branch(remote: str, ref: str, cwd: Path) -> str | None:
-    """The sha ``ref`` has on ``remote`` right now (``ls-remote``), None when it does not exist.
+def remote_urls(remote: str, cwd: Path, *, push: bool) -> list[str]:
+    """``git remote get-url --all [--push] <remote>``: rewrites applied, never printed."""
+    safe_arg(remote, "remote")
+    args = ["remote", "get-url", "--all", *(["--push"] if push else []), remote]
+    try:
+        out = git(args, cwd)
+    except GuardError:
+        raise GuardError("git remote get-url failed: unknown remote?") from None
+    return [line for line in out.decode("utf-8", "surrogateescape").splitlines() if line]
 
-    Any failure (network, unknown remote) is rc 2: the caller cannot tell what
-    the remote already has.
+
+def read_url(location: str, cwd: Path) -> str:
+    """Where ``ls-remote <location>`` would connect (``ls-remote --get-url``), without connecting.
+
+    It resolves a remote name to its URL and applies ``url.*.insteadOf``.
+    """
+    safe_arg(location, "remote")
+    return git(["ls-remote", "--get-url", location], cwd).decode("utf-8", "surrogateescape").rstrip("\n")
+
+
+def remote_branch(remote: str, ref: str, cwd: Path) -> str | None:
+    """The sha ``ref`` has on ``remote`` (a name or a URL) right now, None when it does not exist.
+
+    Any failure (network, timeout, unknown remote) is rc 2: the caller cannot
+    tell what the remote already has. The message keeps the cause (failed with
+    an rc, or timed out) but never the remote's URL.
     """
     safe_arg(remote, "remote")
     try:
         out = git(["ls-remote", "--refs", remote, ref], cwd)
-    except GuardError:
-        raise GuardError("git ls-remote failed: cannot tell what the remote already has") from None
+    except GuardError as exc:
+        raise GuardError(f"{exc}: cannot tell what the remote already has") from None
     for line in out.decode("ascii", "replace").splitlines():
         sha, _, name = line.partition("\t")
         if name == ref:

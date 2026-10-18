@@ -34,6 +34,7 @@ CANARY_NAMES = (
     "POSTGRES_USER", "POSTGRES_DB", "POSTGRES_PASSWORD", "ADMITLENS_DB_PORT",
     "ADMITLENS_DATABASE_URL", "ADMITLENS_TEST_DATABASE_URL",
     "GITHUB_TOKEN", "API_KEY", "SECRET_KEY",
+    "PUSH_URL",  # set by the pre-push hook: read as $$PUSH_URL, never expanded by make
 )
 
 

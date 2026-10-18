@@ -147,7 +147,9 @@ def clean_env(
         "PYTHONPATH": str(GUARDS_ROOT),
         "PYTHONDONTWRITEBYTECODE": "1",
     }
-    for key in ("CI", "GUARDS_ALLOW_SKIP", "TMPDIR"):
+    # CI is not passed on: the guards read it (history), so tests that need it set it
+    # explicitly and every other test behaves the same locally and in CI.
+    for key in ("GUARDS_ALLOW_SKIP", "TMPDIR"):
         if key in os.environ:
             env[key] = os.environ[key]
     if extra:

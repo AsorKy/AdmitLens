@@ -25,6 +25,7 @@ pytestmark = [pytest.mark.git, pytest.mark.make, pytest.mark.gitleaks]
 
 # The exact text guards/gitleaks.py raises when the configured binary is missing.
 GITLEAKS_MISSING = "gitleaks not found at the configured path"
+ZERO_SHA = "0" * 40
 
 
 def try_commit(
@@ -358,6 +359,46 @@ def test_pre_push_remote_ahead_is_rc2(wired: WiredRepo) -> None:
     assert res.rc != 0
     assert "git fetch" in out and "Error 2" in out
     assert wired.remote_head() == ahead
+
+
+def _bare(repo: WiredRepo, name: str) -> list[str]:
+    return ["--git-dir", str(repo.root.parent / name)]
+
+
+def test_pre_push_new_branch_to_a_normal_remote_passes(wired: WiredRepo) -> None:
+    """One url, no pushurl: a clean new branch goes through the hook (PUSH_URL = the only URL)."""
+    wired.git("checkout", "-q", "-b", "feat")
+    assert try_commit(wired, msg("feature"), no_verify=True).rc == 0
+    res = wired.push("origin", "feat")
+    assert res.rc == 0, res
+    assert wired.remote_head("refs/heads/feat") == wired.head()
+
+
+def test_pre_push_scans_against_the_push_url_not_the_fetch_url(wired: WiredRepo) -> None:
+    """D-0011: pushurl != url and the fetch remote's main already holds a leak; the push target never saw it."""
+    shutil.copytree(wired.root.parent / "remote.git", wired.root.parent / "push.git")
+    wired.git("checkout", "-q", "-b", "feat")
+    pat = make_fake("github-pat", "push-url")  # gitleaks-only rule
+    wired.write("notes.txt", f"token {pat.reveal()}\n")
+    assert try_commit(wired, msg("leak"), "notes.txt", no_verify=True).rc == 0
+    leak = wired.head()
+    wired.write("notes.txt", "clean\n")
+    assert try_commit(wired, msg("clean"), "notes.txt", no_verify=True).rc == 0
+    wired.git("push", "-q", "--no-verify", "origin", f"{leak}:refs/heads/main")  # the fetch remote has it
+    wired.git("config", "remote.origin.pushurl", "../push.git")
+    res = wired.push("origin", "feat")
+    assert res.rc != 0, res
+    assert "github-pat" in wired.output(res)
+    assert leak in wired.output(res)
+    assert wired.git(*_bare(wired, "push.git"), "for-each-ref", "refs/heads/feat").stdout == ""
+    assert_absent_all(res, [pat], "pre-push-push-url")
+    # A manual run has no PUSH_URL: with a split remote it refuses instead of guessing.
+    manual = wired.make("hook-pre-push", input=f"refs/heads/feat {wired.head()} refs/heads/feat {ZERO_SHA}\n",
+                        env={"REMOTE": "origin"})
+    assert manual.rc != 0 and "fetch URL" in wired.output(manual)
+    # git itself names the URL ("failed to push some refs to ..."); the guards never do.
+    guard_lines = [ln for ln in wired.output(res).splitlines() if not ln.startswith(("error:", "To "))]
+    assert not any("push.git" in ln for ln in guard_lines + wired.output(manual).splitlines())
 
 
 def test_pre_push_runs_level_checks_and_warns_without_them(wired: WiredRepo) -> None:

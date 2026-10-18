@@ -211,13 +211,6 @@ def ws(tmp_path: Path, request: pytest.FixtureRequest) -> Workspace:
     return Workspace(tmp_path, random.Random(request.node.nodeid))
 
 
-@pytest.fixture
-def default_only(tmp_path: Path) -> Path:
-    path = tmp_path / "default-only.toml"
-    path.write_text("[extend]\nuseDefault = true\n", encoding="utf-8")
-    return path
-
-
 def rules_for(findings: list[Finding], file: str) -> set[str]:
     return {f.rule for f in findings if f.file == file}
 
@@ -299,14 +292,209 @@ def test_invalid_config_fails_loudly(ws: Workspace, tmp_path: Path) -> None:
     assert result.rc not in (0, 1)
 
 
+# ------------------------------------------------------------------ the shared corpus
+#
+# Most cases below are one small file each. Running gitleaks once per case cost
+# ~0.2 s x 130 cases (D-0008), so every case is written into its own directory
+# (``c0000/``, ``c0001/``, ...) of ONE workspace, scanned once with the repo config
+# and once with the default-only config. Each test then reads the findings of its
+# own directory, with that prefix stripped: paths and line numbers are exactly
+# what a lone scan reports. Every path rule is anchored with ``(?:^|/)``, so the
+# prefix cannot change a match, and gitleaks matches file by file. The corpus
+# scan also runs ``assert_absent`` for every fake of every case.
+
+
+DSN_SCHEMES = ["postgresql", "postgresql+psycopg", "postgres+asyncpg", "redis", "rediss", "amqps", "mongodb+srv", "mysql"]
+DSN_NEGATIVE = [
+    "postgresql://app@db.test:5432/x",
+    "postgresql+psycopg://app@localhost/admitlens_test",
+    "postgresql://app:${POSTGRES_PASSWORD}@db:5432/x",
+    "postgresql://app:<password>@db:5432/x",
+    "postgresql://app:__GENERATE__@db:5432/x",
+    "redis://:__REQUIRED__@cache:6379/0",
+    "redis://cache:6379/0",
+    "https://example.test/a:b@c",
+]
+ASSIGN_POSITIVE = [
+    ("settings/app.yml", "  {name}: {value}\n"),
+    ("settings/app.yaml", "{name}: \"{value}\"\n"),
+    ("pyproject.toml", "{name} = \"{value}\"\n"),
+    ("docker-compose.yml", "    environment:\n      {name}: {value}\n"),
+    ("setup.cfg", "{name} = {value}\n"),
+    ("conf.ini", "{name}={value}\n"),
+    (".env.local", "{name}={value}\n"),
+    (".env", "{name}={value}\n"),
+]
+ASSIGN_WORDS = ["TOK" + "EN", "SEC" + "RET", "API_" + "KEY", "DS" + "N", "PRIVATE_" + "KEY"]
+ASSIGN_NEGATIVE = [
+    (".env.example", "X_PASSWORD=__GENERATE__\nX_TOKEN=\nY_SECRET=__REQUIRED__\nZ_DSN=${Z_DSN}\n"),
+    (".env.example", "A_TOKEN=<paste-a-token-here>\nPOSTGRES_USER=admitlens\n"),
+    ("ci.yml", "env:\n  X_TOKEN: ${{ secrets.X_TOKEN }}\n  Y_PASSWORD: $$Y_PASSWORD\n"),
+    ("docker-compose.yml", "    POSTGRES_PASSWORD_FILE: /run/secrets/db_password\n    secrets:\n      - db_password\n"),
+    ("app.yml", "ACCESS_TOKEN_TTL: 900\nsecret_rotation_days: 30\nuse_secret: true\n"),
+    ("app.yml", "secrets:\n  db_password:\n    file: ./x\n"),
+    ("data.json", "{\"user_password\": \"abcdefgh\"}\n"),
+    ("notes.md", "user_password = abcdefgh\n"),
+]
+PY_NEGATIVE = [
+    'X_PASSWORD = os.environ["X_PASSWORD"]',
+    'db_password = os.environ.get("DB_PASSWORD")',
+    "db_password: str = Field(...)",
+    'db_password: SecretStr = Field(default="")',
+    "token = settings.api_token",
+    'if x_token == "abc":',
+    "password = None",
+    'DB_DSN = f"{scheme}://host/db"',
+    'password = ""',
+]
+SSN_POSITIVE = [("123", "45", "6789"), ("001", "01", "0001"), ("665", "99", "9999"), ("667", "10", "1000"), ("899", "50", "5050")]
+SSN_INVALID = [("000", "12", "3456"), ("666", "12", "3456"), ("900", "12", "3456"), ("999", "12", "3456"), ("123", "00", "6789"), ("123", "45", "0000")]
+SSN_LOOKALIKES = ["2026-10-17T13:24:05.120Z", "2026-10-17", "123-456-7890", "call 555-123-4567 now", "1234-56-78901"]
+LOCAL_KINDS = ["mac", "linux", "win", "slug", "claude", "folders"]
+LOCAL_NEGATIVE = [
+    "/home/runner/work/admitlens/admitlens",
+    "./src/users/models.py",
+    "/usr/local/bin/python",
+    "/opt/app/data",
+    "users-table",
+    "/var/run/postgresql",
+]
+VAULT_POSITIVE = [("Obsid", "ian Va", "ult/Notes"), ("[", "[proj", "ects/AdmitLens]]")]
+VAULT_NEGATIVE = ["an obsidian vault is a folder", "projects/ is a dir", "[link](projects/x)", "[[wikilink]]"]
+PATH_POSITIVE = [
+    (".env", "admitlens-path-env"),
+    (".env.local", "admitlens-path-env"),
+    (".env.production", "admitlens-path-env"),
+    ("level-1/backend/.env", "admitlens-path-env"),
+    (".env.examples", "admitlens-path-env"),
+    (".env.exampl", "admitlens-path-env"),
+    ("data/a.txt", "admitlens-path-data"),
+    ("level-1/data/sub/b.txt", "admitlens-path-data"),
+    ("certs/server.pem", "admitlens-path-key"),
+    ("a.key", "admitlens-path-key"),
+    ("store.p12", "admitlens-path-key"),
+    ("bundle.pfx", "admitlens-path-key"),
+    ("id_rsa", "admitlens-path-key"),
+    ("keys/id_ed25519.pub", "admitlens-path-key"),
+    ("local.db", "admitlens-path-db"),
+    ("x/y.sqlite3", "admitlens-path-db"),
+    ("x.db-wal", "admitlens-path-db"),
+]
+PATH_NEGATIVE = [
+    ".env.example",
+    "level-1/backend/.env.example",
+    "datagen/readme.txt",
+    "src/database.py",
+    "docs/keys.md",
+    "env.txt",
+    "notes/idea_rsa.md",
+    "dbconfig.txt",
+]
+
+
+def _name(*frags: str) -> str:
+    return "".join(frags)
+
+
+class Corpus:
+    """Every case in its own directory of one workspace; two gitleaks scans in total."""
+
+    def __init__(self, ws: Workspace, default_only: Path) -> None:
+        self.ws = ws
+        self._dirs: dict[tuple[object, ...], str] = {}
+        self._build()
+        self._full, _ = ws.scan()
+        self._default, _ = ws.scan(default_only)
+
+    def _put(self, key: tuple[object, ...], rel: str, text: str) -> None:
+        assert key not in self._dirs, key
+        prefix = f"c{len(self._dirs):04d}"
+        self._dirs[key] = prefix
+        self.ws.write(f"{prefix}/{rel}", text)
+
+    @staticmethod
+    def _strip(findings: list[Finding], prefix: str) -> list[Finding]:
+        lead = prefix + "/"
+        return [Finding(f.rule, f.file[len(lead) :], f.line) for f in findings if f.file.startswith(lead)]
+
+    def findings(self, *key: object) -> list[Finding]:
+        """What a lone scan of this case reports with the repo config."""
+        return self._strip(self._full, self._dirs[key])
+
+    def default_findings(self, *key: object) -> list[Finding]:
+        """What a lone scan of this case reports with gitleaks' default rules only."""
+        return self._strip(self._default, self._dirs[key])
+
+    def _build(self) -> None:  # noqa: C901 - one block per case family, mirrors the tests below
+        ws = self.ws
+        self._put(("jwt",), "notes.txt", f"value: {make_jwt(ws).reveal()}\n")
+        for scheme in DSN_SCHEMES:
+            self._put(("dsn+", scheme), "notes.txt", f"first line\nurl is {make_dsn(ws, scheme).reveal()} ok\n")
+        for line in DSN_NEGATIVE:
+            self._put(("dsn-", line), "notes.txt", line + "\n")
+        self._put(("dsn-attr",), "notes.txt", f"{make_dsn(ws, 'postgresql').reveal()}\n")
+        name = _name("DB_", "PASS", "WORD")
+        for path, template in ASSIGN_POSITIVE:
+            self._put(("assign+", path, template), path, template.format(name=name, value=ws.word().reveal()))
+        for word in ASSIGN_WORDS:
+            self._put(("assign-word", word), "a.yml", f"svc_{word}: {ws.word().reveal()}\n")
+        for path, text in ASSIGN_NEGATIVE:
+            self._put(("assign-", path, text), path, text)
+        self._put(("assign-attr",), "a.yml", f"{name}: {ws.word().reveal()}\n")
+        v1, v2 = ws.word(), ws.word()
+        n2 = _name("api_", "TOK", "EN")
+        self._put(("py+",), "settings.py",
+                  f"import os\n\n{name} = \"{v1.reveal()}\"\nclass C:\n    {n2}: str = '{v2.reveal()}'\n")
+        for line in PY_NEGATIVE:
+            self._put(("py-", line), "config.py", f"import os\n{line}\n")
+        for parts in SSN_POSITIVE:
+            self._put(("ssn+", *parts), "notes.txt", f"id\nvalue {make_ssn(ws, *parts).reveal()} end\n")
+        for parts in SSN_INVALID:
+            self._put(("ssn-", *parts), "notes.txt", f"value {make_ssn(ws, *parts).reveal()} end\n")
+        for text in SSN_LOOKALIKES:
+            self._put(("ssn~", text), "notes.txt", text + "\n")
+        self._put(("ssn-attr",), "notes.txt", f"{make_ssn(ws, '123', '45', '6789').reveal()}\n")
+        for kind in LOCAL_KINDS:
+            self._put(("local+", kind), "notes.txt", f"x\nsee {user_path(ws, kind).reveal()}\n")
+        self._put(("local-attr",), "notes.txt", f"{user_path(ws, 'mac').reveal()}\n")
+        for text in LOCAL_NEGATIVE:
+            self._put(("local-", text), "notes.txt", text + "\n")
+        for marker in VAULT_POSITIVE:
+            self._put(("vault+", marker), "README.txt", f"a\nb\nsee {ws.fake('vault', ''.join(marker)).reveal()}\n")
+        for text in VAULT_NEGATIVE:
+            self._put(("vault-", text), "README.txt", text + "\n")
+        for path, _rule in PATH_POSITIVE:
+            self._put(("path+", path), path, "N=1\n")
+        for path in PATH_NEGATIVE:
+            self._put(("path-", path), path, "N=1\n")
+
+
+@pytest.fixture(scope="module")
+def corpus(tmp_path_factory: pytest.TempPathFactory) -> Corpus:
+    root = tmp_path_factory.mktemp("gitleaks-corpus")
+    default_only = root / "default-only.toml"
+    default_only.write_text("[extend]\nuseDefault = true\n", encoding="utf-8")
+    ws_root = root / "ws"
+    ws_root.mkdir()
+    return Corpus(Workspace(ws_root, random.Random("gitleaks-corpus")), default_only)
+
+
+def test_corpus_is_not_vacuous(corpus: Corpus) -> None:
+    """The aggregated scan found the custom rules and kept every case apart."""
+    assert len(corpus._dirs) >= 110
+    assert {f.rule for f in corpus._full} >= {
+        "jwt", "admitlens-dsn-password", "admitlens-secret-assignment", "admitlens-secret-assignment-py",
+        "admitlens-ssn", "admitlens-local-path", "admitlens-vault-marker", "admitlens-path-env",
+        "admitlens-path-data", "admitlens-path-key", "admitlens-path-db",
+    }
+    assert all(f.file.split("/", 1)[0] in set(corpus._dirs.values()) for f in corpus._full)
+
+
 # ------------------------------------------------------------------ default rules
 
 
-def test_default_rules_still_active_jwt(ws: Workspace) -> None:
-    jwt = make_jwt(ws)
-    ws.write("notes.txt", f"value: {jwt.reveal()}\n")
-    findings, _ = ws.scan()
-    rules = rules_for(findings, "notes.txt")
+def test_default_rules_still_active_jwt(corpus: Corpus) -> None:
+    rules = rules_for(corpus.findings("jwt"), "notes.txt")
     assert "jwt" in rules, sorted(rules)
     assert not any(r.startswith("admitlens-") for r in rules)
 
@@ -320,15 +508,9 @@ def test_jwt_via_stdin(ws: Workspace) -> None:
 # ------------------------------------------------------------------ dsn-password
 
 
-@pytest.mark.parametrize(
-    "scheme",
-    ["postgresql", "postgresql+psycopg", "postgres+asyncpg", "redis", "rediss", "amqps", "mongodb+srv", "mysql"],
-)
-def test_dsn_password_positive(ws: Workspace, scheme: str) -> None:
-    dsn = make_dsn(ws, scheme)
-    ws.write("notes.txt", f"first line\nurl is {dsn.reveal()} ok\n")
-    findings, _ = ws.scan()
-    assert Finding("admitlens-dsn-password", "notes.txt", 2) in findings
+@pytest.mark.parametrize("scheme", DSN_SCHEMES)
+def test_dsn_password_positive(corpus: Corpus, scheme: str) -> None:
+    assert Finding("admitlens-dsn-password", "notes.txt", 2) in corpus.findings("dsn+", scheme)
 
 
 def test_dsn_password_positive_via_stdin(ws: Workspace) -> None:
@@ -337,274 +519,122 @@ def test_dsn_password_positive_via_stdin(ws: Workspace) -> None:
     assert "admitlens-dsn-password" in {f.rule for f in findings}
 
 
-@pytest.mark.parametrize(
-    "line",
-    [
-        "postgresql://app@db.test:5432/x",
-        "postgresql+psycopg://app@localhost/admitlens_test",
-        "postgresql://app:${POSTGRES_PASSWORD}@db:5432/x",
-        "postgresql://app:<password>@db:5432/x",
-        "postgresql://app:__GENERATE__@db:5432/x",
-        "redis://:__REQUIRED__@cache:6379/0",
-        "redis://cache:6379/0",
-        "https://example.test/a:b@c",
-    ],
-)
-def test_dsn_password_negative(ws: Workspace, line: str) -> None:
-    ws.write("notes.txt", line + "\n")
-    findings, _ = ws.scan()
-    assert findings == []
+@pytest.mark.parametrize("line", DSN_NEGATIVE)
+def test_dsn_password_negative(corpus: Corpus, line: str) -> None:
+    assert corpus.findings("dsn-", line) == []
 
 
-def test_dsn_attribution_default_rules_miss_it(ws: Workspace, default_only: Path) -> None:
-    dsn = make_dsn(ws, "postgresql")
-    ws.write("notes.txt", f"{dsn.reveal()}\n")
-    assert ws.scan(default_only)[0] == []
-    assert "admitlens-dsn-password" in custom_rules(ws.scan()[0])
+def test_dsn_attribution_default_rules_miss_it(corpus: Corpus) -> None:
+    assert corpus.default_findings("dsn-attr") == []
+    assert "admitlens-dsn-password" in custom_rules(corpus.findings("dsn-attr"))
 
 
 # ------------------------------------------------------------------ secret-assignment (config)
 
 
-def _name(*frags: str) -> str:
-    return "".join(frags)
-
-
-@pytest.mark.parametrize(
-    ("path", "template"),
-    [
-        ("settings/app.yml", "  {name}: {value}\n"),
-        ("settings/app.yaml", "{name}: \"{value}\"\n"),
-        ("pyproject.toml", "{name} = \"{value}\"\n"),
-        ("docker-compose.yml", "    environment:\n      {name}: {value}\n"),
-        ("setup.cfg", "{name} = {value}\n"),
-        ("conf.ini", "{name}={value}\n"),
-        (".env.local", "{name}={value}\n"),
-        (".env", "{name}={value}\n"),
-    ],
-)
-def test_secret_assignment_positive(ws: Workspace, path: str, template: str) -> None:
-    value = ws.word()
+@pytest.mark.parametrize(("path", "template"), ASSIGN_POSITIVE)
+def test_secret_assignment_positive(corpus: Corpus, path: str, template: str) -> None:
     name = _name("DB_", "PASS", "WORD")
-    text = template.format(name=name, value=value.reveal())
-    ws.write(path, text)
-    line = 1 + text.splitlines().index(next(ln for ln in text.splitlines() if name in ln))
-    findings, _ = ws.scan()
-    assert Finding("admitlens-secret-assignment", path, line) in findings
+    lines = template.format(name=name, value="v").splitlines()
+    line = 1 + lines.index(next(ln for ln in lines if name in ln))
+    assert Finding("admitlens-secret-assignment", path, line) in corpus.findings("assign+", path, template)
 
 
-@pytest.mark.parametrize("word", ["TOK" + "EN", "SEC" + "RET", "API_" + "KEY", "DS" + "N", "PRIVATE_" + "KEY"])
-def test_secret_assignment_name_variants(ws: Workspace, word: str) -> None:
-    value = ws.word()
-    ws.write("a.yml", f"svc_{word}: {value.reveal()}\n")
-    findings, _ = ws.scan()
-    assert Finding("admitlens-secret-assignment", "a.yml", 1) in findings
+@pytest.mark.parametrize("word", ASSIGN_WORDS)
+def test_secret_assignment_name_variants(corpus: Corpus, word: str) -> None:
+    assert Finding("admitlens-secret-assignment", "a.yml", 1) in corpus.findings("assign-word", word)
 
 
-@pytest.mark.parametrize(
-    ("path", "text"),
-    [
-        (".env.example", "X_PASSWORD=__GENERATE__\nX_TOKEN=\nY_SECRET=__REQUIRED__\nZ_DSN=${Z_DSN}\n"),
-        (".env.example", "A_TOKEN=<paste-a-token-here>\nPOSTGRES_USER=admitlens\n"),
-        ("ci.yml", "env:\n  X_TOKEN: ${{ secrets.X_TOKEN }}\n  Y_PASSWORD: $$Y_PASSWORD\n"),
-        ("docker-compose.yml", "    POSTGRES_PASSWORD_FILE: /run/secrets/db_password\n    secrets:\n      - db_password\n"),
-        ("app.yml", "ACCESS_TOKEN_TTL: 900\nsecret_rotation_days: 30\nuse_secret: true\n"),
-        ("app.yml", "secrets:\n  db_password:\n    file: ./x\n"),
-        ("data.json", "{\"user_password\": \"abcdefgh\"}\n"),
-        ("notes.md", "user_password = abcdefgh\n"),
-    ],
-)
-def test_secret_assignment_negative(ws: Workspace, path: str, text: str) -> None:
-    ws.write(path, text)
-    findings, _ = ws.scan()
+@pytest.mark.parametrize(("path", "text"), ASSIGN_NEGATIVE)
+def test_secret_assignment_negative(corpus: Corpus, path: str, text: str) -> None:
+    findings = corpus.findings("assign-", path, text)
     assert custom_rules(findings) == set(), findings
 
 
-def test_secret_assignment_attribution(ws: Workspace, default_only: Path) -> None:
-    value = ws.word()
-    ws.write("a.yml", f"{_name('DB_', 'PASS', 'WORD')}: {value.reveal()}\n")
-    assert ws.scan(default_only)[0] == []
-    assert "admitlens-secret-assignment" in custom_rules(ws.scan()[0])
+def test_secret_assignment_attribution(corpus: Corpus) -> None:
+    assert corpus.default_findings("assign-attr") == []
+    assert "admitlens-secret-assignment" in custom_rules(corpus.findings("assign-attr"))
 
 
 # ------------------------------------------------------------------ secret-assignment (python)
 
 
-def test_python_literal_positive(ws: Workspace) -> None:
-    v1, v2 = ws.word(), ws.word()
-    n1, n2 = _name("DB_", "PASS", "WORD"), _name("api_", "TOK", "EN")
-    ws.write(
-        "settings.py",
-        f"import os\n\n{n1} = \"{v1.reveal()}\"\nclass C:\n    {n2}: str = '{v2.reveal()}'\n",
-    )
-    findings, _ = ws.scan()
+def test_python_literal_positive(corpus: Corpus) -> None:
+    findings = corpus.findings("py+")
     assert Finding("admitlens-secret-assignment-py", "settings.py", 3) in findings
     assert Finding("admitlens-secret-assignment-py", "settings.py", 5) in findings
 
 
-@pytest.mark.parametrize(
-    "line",
-    [
-        'X_PASSWORD = os.environ["X_PASSWORD"]',
-        'db_password = os.environ.get("DB_PASSWORD")',
-        "db_password: str = Field(...)",
-        'db_password: SecretStr = Field(default="")',
-        "token = settings.api_token",
-        'if x_token == "abc":',
-        "password = None",
-        'DB_DSN = f"{scheme}://host/db"',
-        'password = ""',
-    ],
-)
-def test_python_literal_negative(ws: Workspace, line: str) -> None:
-    ws.write("config.py", f"import os\n{line}\n")
-    findings, _ = ws.scan()
+@pytest.mark.parametrize("line", PY_NEGATIVE)
+def test_python_literal_negative(corpus: Corpus, line: str) -> None:
+    findings = corpus.findings("py-", line)
     assert custom_rules(findings) == set(), findings
 
 
 # ------------------------------------------------------------------ ssn
 
 
-@pytest.mark.parametrize(
-    ("area", "group", "serial"),
-    [("123", "45", "6789"), ("001", "01", "0001"), ("665", "99", "9999"), ("667", "10", "1000"), ("899", "50", "5050")],
-)
-def test_ssn_positive(ws: Workspace, area: str, group: str, serial: str) -> None:
-    ssn = make_ssn(ws, area, group, serial)
-    ws.write("notes.txt", f"id\nvalue {ssn.reveal()} end\n")
-    findings, _ = ws.scan()
-    assert Finding("admitlens-ssn", "notes.txt", 2) in findings
+@pytest.mark.parametrize(("area", "group", "serial"), SSN_POSITIVE)
+def test_ssn_positive(corpus: Corpus, area: str, group: str, serial: str) -> None:
+    assert Finding("admitlens-ssn", "notes.txt", 2) in corpus.findings("ssn+", area, group, serial)
 
 
-@pytest.mark.parametrize(
-    ("area", "group", "serial"),
-    [("000", "12", "3456"), ("666", "12", "3456"), ("900", "12", "3456"), ("999", "12", "3456"), ("123", "00", "6789"), ("123", "45", "0000")],
-)
-def test_ssn_invalid_ranges_negative(ws: Workspace, area: str, group: str, serial: str) -> None:
-    ssn = make_ssn(ws, area, group, serial)
-    ws.write("notes.txt", f"value {ssn.reveal()} end\n")
-    findings, _ = ws.scan()
-    assert "admitlens-ssn" not in {f.rule for f in findings}
+@pytest.mark.parametrize(("area", "group", "serial"), SSN_INVALID)
+def test_ssn_invalid_ranges_negative(corpus: Corpus, area: str, group: str, serial: str) -> None:
+    assert "admitlens-ssn" not in {f.rule for f in corpus.findings("ssn-", area, group, serial)}
 
 
-@pytest.mark.parametrize(
-    "text",
-    ["2026-10-17T13:24:05.120Z", "2026-10-17", "123-456-7890", "call 555-123-4567 now", "1234-56-78901"],
-)
-def test_ssn_lookalikes_negative(ws: Workspace, text: str) -> None:
-    ws.write("notes.txt", text + "\n")
-    findings, _ = ws.scan()
-    assert findings == []
+@pytest.mark.parametrize("text", SSN_LOOKALIKES)
+def test_ssn_lookalikes_negative(corpus: Corpus, text: str) -> None:
+    assert corpus.findings("ssn~", text) == []
 
 
-def test_ssn_attribution(ws: Workspace, default_only: Path) -> None:
-    ssn = make_ssn(ws, "123", "45", "6789")
-    ws.write("notes.txt", f"{ssn.reveal()}\n")
-    assert ws.scan(default_only)[0] == []
+def test_ssn_attribution(corpus: Corpus) -> None:
+    assert corpus.default_findings("ssn-attr") == []
 
 
 # ------------------------------------------------------------------ local-path
 
 
-@pytest.mark.parametrize("kind", ["mac", "linux", "win", "slug", "claude", "folders"])
-def test_local_path_positive(ws: Workspace, kind: str) -> None:
-    path = user_path(ws, kind)
-    ws.write("notes.txt", f"x\nsee {path.reveal()}\n")
-    findings, _ = ws.scan()
-    assert Finding("admitlens-local-path", "notes.txt", 2) in findings
+@pytest.mark.parametrize("kind", LOCAL_KINDS)
+def test_local_path_positive(corpus: Corpus, kind: str) -> None:
+    assert Finding("admitlens-local-path", "notes.txt", 2) in corpus.findings("local+", kind)
 
 
-def test_local_path_attribution(ws: Workspace, default_only: Path) -> None:
-    path = user_path(ws, "mac")
-    ws.write("notes.txt", f"{path.reveal()}\n")
-    assert ws.scan(default_only)[0] == []
+def test_local_path_attribution(corpus: Corpus) -> None:
+    assert corpus.default_findings("local-attr") == []
 
 
-@pytest.mark.parametrize(
-    "text",
-    [
-        "/home/runner/work/admitlens/admitlens",
-        "./src/users/models.py",
-        "/usr/local/bin/python",
-        "/opt/app/data",
-        "users-table",
-        "/var/run/postgresql",
-    ],
-)
-def test_local_path_negative(ws: Workspace, text: str) -> None:
-    ws.write("notes.txt", text + "\n")
-    findings, _ = ws.scan()
-    assert findings == []
+@pytest.mark.parametrize("text", LOCAL_NEGATIVE)
+def test_local_path_negative(corpus: Corpus, text: str) -> None:
+    assert corpus.findings("local-", text) == []
 
 
 # ------------------------------------------------------------------ vault-marker
 
 
-@pytest.mark.parametrize(
-    "marker",
-    [("Obsid", "ian Va", "ult/Notes"), ("[", "[proj", "ects/AdmitLens]]")],
-)
-def test_vault_marker_positive(ws: Workspace, marker: tuple[str, ...]) -> None:
-    fake = ws.fake("vault", "".join(marker))
-    ws.write("README.txt", f"a\nb\nsee {fake.reveal()}\n")
-    findings, _ = ws.scan()
-    assert Finding("admitlens-vault-marker", "README.txt", 3) in findings
+@pytest.mark.parametrize("marker", VAULT_POSITIVE)
+def test_vault_marker_positive(corpus: Corpus, marker: tuple[str, ...]) -> None:
+    assert Finding("admitlens-vault-marker", "README.txt", 3) in corpus.findings("vault+", marker)
 
 
-@pytest.mark.parametrize("text", ["an obsidian vault is a folder", "projects/ is a dir", "[link](projects/x)", "[[wikilink]]"])
-def test_vault_marker_negative(ws: Workspace, text: str) -> None:
-    ws.write("README.txt", text + "\n")
-    findings, _ = ws.scan()
-    assert findings == []
+@pytest.mark.parametrize("text", VAULT_NEGATIVE)
+def test_vault_marker_negative(corpus: Corpus, text: str) -> None:
+    assert corpus.findings("vault-", text) == []
 
 
 # ------------------------------------------------------------------ path-only rules
 
 
-@pytest.mark.parametrize(
-    ("path", "rule"),
-    [
-        (".env", "admitlens-path-env"),
-        (".env.local", "admitlens-path-env"),
-        (".env.production", "admitlens-path-env"),
-        ("level-1/backend/.env", "admitlens-path-env"),
-        (".env.examples", "admitlens-path-env"),
-        (".env.exampl", "admitlens-path-env"),
-        ("data/a.txt", "admitlens-path-data"),
-        ("level-1/data/sub/b.txt", "admitlens-path-data"),
-        ("certs/server.pem", "admitlens-path-key"),
-        ("a.key", "admitlens-path-key"),
-        ("store.p12", "admitlens-path-key"),
-        ("bundle.pfx", "admitlens-path-key"),
-        ("id_rsa", "admitlens-path-key"),
-        ("keys/id_ed25519.pub", "admitlens-path-key"),
-        ("local.db", "admitlens-path-db"),
-        ("x/y.sqlite3", "admitlens-path-db"),
-        ("x.db-wal", "admitlens-path-db"),
-    ],
-)
-def test_path_rules_positive(ws: Workspace, path: str, rule: str) -> None:
-    ws.write(path, "N=1\n")
-    findings, _ = ws.scan()
+@pytest.mark.parametrize(("path", "rule"), PATH_POSITIVE)
+def test_path_rules_positive(corpus: Corpus, path: str, rule: str) -> None:
+    findings = corpus.findings("path+", path)
     assert rule in rules_for(findings, path), findings
 
 
-@pytest.mark.parametrize(
-    "path",
-    [
-        ".env.example",
-        "level-1/backend/.env.example",
-        "datagen/readme.txt",
-        "src/database.py",
-        "docs/keys.md",
-        "env.txt",
-        "notes/idea_rsa.md",
-        "dbconfig.txt",
-    ],
-)
-def test_path_rules_negative(ws: Workspace, path: str) -> None:
-    ws.write(path, "N=1\n")
-    findings, _ = ws.scan()
+@pytest.mark.parametrize("path", PATH_NEGATIVE)
+def test_path_rules_negative(corpus: Corpus, path: str) -> None:
+    findings = corpus.findings("path-", path)
     assert findings == [], findings
 
 

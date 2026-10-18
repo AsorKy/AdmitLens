@@ -4,8 +4,8 @@
 # .RECIPEPREFIX, file/let functions, != or ::= assignments, or grouped targets.
 # Every recipe line starts with @. This file never includes .env and never
 # expands a secret as a Make variable; values that come from git hooks (remote
-# name, message path) are read from the environment as $$VAR inside the shell,
-# so Make never expands them. The hooks run `make -f Makefile` with MAKEFILES and
+# name, push URL, message path) are read from the environment as $$VAR inside
+# the shell, so Make never expands them (nor prints them under make -n). The hooks run `make -f Makefile` with MAKEFILES and
 # MAKEFLAGS cleared, so an inherited make environment cannot neuter them.
 # Level Makefiles live in their own folders; this file never names a level.
 
@@ -82,5 +82,5 @@ hook-pre-push:
 	@if [ -z "$$REMOTE" ]; then echo "hook-pre-push: REMOTE is required" >&2; exit 2; fi; \
 	umask 077; refs=$$(mktemp) || exit 2; trap 'rm -f "$$refs"' EXIT INT TERM; \
 	cat >"$$refs" || exit 2; \
-	$(GUARDS) prepush "$$REMOTE" <"$$refs" || exit $$?; \
+	PUSH_URL="$$PUSH_URL" $(GUARDS) prepush "$$REMOTE" <"$$refs" || exit $$?; \
 	LEVEL_MAKE="$(LEVEL_MAKE)" sh "$(GUARDS_DIR)/bin/level-checks.sh" "$$REMOTE" "$$refs"

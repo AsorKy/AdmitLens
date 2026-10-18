@@ -27,7 +27,7 @@ from support.fakes import (
     require_gitleaks,
     run,
 )
-from support.wired import WiredRepo, bare_wired_repo
+from support.wired import WiredRepo, bare_wired_repo, clone_template
 
 from guards.findings import GuardError
 from guards.gitleaks import binary_ok, binary_pin, check_version, file_sha256, platform_key
@@ -39,6 +39,27 @@ pytestmark = [pytest.mark.make, pytest.mark.git]
 def fresh(tmp_path: Path, uv_cache: Path) -> WiredRepo:
     require_gitleaks()
     return bare_wired_repo(tmp_path, uv_cache)
+
+
+@pytest.fixture(scope="session")
+def setup_template(tmp_path_factory: pytest.TempPathFactory, uv_cache: Path) -> Path:
+    """A wired repo after one ``make setup`` (built once; ``make setup`` itself is tested below)."""
+    require_gitleaks()
+    base = tmp_path_factory.mktemp("setup-template")
+    repo = bare_wired_repo(base, uv_cache)
+    res = repo.make("setup")
+    if res.rc != 0:
+        raise AssertionError(f"make setup failed in the template: {res!r}")
+    healthy = repo.make("doctor")
+    if healthy.rc != 0:  # so each broken-state test fails only because of its breaker
+        raise AssertionError(f"make doctor fails on the set-up template: {healthy!r}")
+    return base
+
+
+@pytest.fixture
+def set_up(tmp_path: Path, setup_template: Path, uv_cache: Path) -> WiredRepo:
+    """A copy of the set-up template, with its own HOME."""
+    return clone_template(setup_template, tmp_path / "s", uv_cache)
 
 
 def _setup(repo: WiredRepo) -> RunResult:
@@ -172,8 +193,8 @@ BROKEN: list[tuple[str, Breaker, str]] = [
 
 
 @pytest.mark.parametrize(("case", "breaker", "check"), BROKEN, ids=[b[0] for b in BROKEN])
-def test_doctor_fails_in_broken_state(fresh: WiredRepo, tmp_path: Path, case: str, breaker: Breaker, check: str) -> None:
-    _setup(fresh)
+def test_doctor_fails_in_broken_state(set_up: WiredRepo, tmp_path: Path, case: str, breaker: Breaker, check: str) -> None:
+    fresh = set_up  # healthy: the template's own doctor run passed
     env = breaker(fresh, tmp_path)
     res = fresh.make("doctor", env=env)
     assert res.rc != 0, case

@@ -44,7 +44,7 @@ def _files(seed: str) -> dict[str, tuple[str, str]]:
     out = {}
     for shape in SHAPES:
         v = _evasive(shape, seed)
-        out[f"dsn-{shape}.txt"] = (f"url = pos" + "tgres://app:" + v + "@db.test:5432/x\n", "content-dsn-password")
+        out[f"dsn-{shape}.txt"] = ("url = pos" + "tgres://app:" + v + "@db.test:5432/x\n", "content-dsn-password")
         out[f"conf-{shape}.yml"] = (f"svc:\n  {name}: {v}\n", "content-secret-assignment")
         out[f"set-{shape}.py"] = (f'import os\n{name} = "{v}"\n', "content-secret-assignment-py")
     return out

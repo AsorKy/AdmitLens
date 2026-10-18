@@ -6,7 +6,7 @@
     python -m guards message <file>
     python -m guards identity <range>
     python -m guards lint
-    python -m guards prepush <remote-name>      # git pre-push stdin
+    python -m guards prepush <remote-name>      # git pre-push stdin; env PUSH_URL
     python -m guards history                    # every commit on every ref
     python -m guards doctor                     # local setup health (ok/warn/FAIL)
 
@@ -18,7 +18,15 @@ file or message is reported as ``:unmapped`` rather than dropped.
 stderr: a short human summary, without values.
 Exit: 0 clean, 1 findings, 2 error or missing tool (fail closed).
 
-Arguments are never echoed back: a usage error only names the mode.
+Environment:
+
+* ``PUSH_URL`` (``prepush`` and ``range`` with a zero base): the URL git is
+  pushing to (the pre-push hook's ``$2``). ``ls-remote`` asks that URL what
+  ``main`` is, never the remote's fetch URL. Without it the remote name is used
+  only when its push and fetch URLs are one and the same; otherwise rc 2.
+* ``CI=true`` (``history``): ``refs/remotes/origin/main`` must exist, or rc 2.
+
+Arguments and URLs are never echoed back: a usage error only names the mode.
 """
 
 from __future__ import annotations
@@ -61,6 +69,7 @@ modes:
 
 MAIN_REF = "refs/heads/main"
 HISTORY_REMOTE = "origin"
+PUSH_URL_ENV = "PUSH_URL"
 
 
 @dataclass
@@ -234,11 +243,10 @@ def mode_message(ctx: Context, file: str) -> list[Finding]:
 # --------------------------------------------------------------------------- history
 
 
-def _commit_identity(ctx: Context, sha: str) -> list[Finding]:
-    out = gitutil.git(["log", "-1", "--format=%an%x00%ae%x00%cn%x00%ce", sha, "--"], ctx.repo)
-    an, ae, cn, ce = (_decode(out).rstrip("\n").split("\0") + ["", "", "", ""])[:4]
-    return identity.check_identity("author", an, ae, ctx.markers, sha) + identity.check_identity(
-        "committer", cn, ce, ctx.markers, sha
+def _commit_identity(ctx: Context, info: gitutil.CommitInfo) -> list[Finding]:
+    sha = info.sha
+    return identity.check_identity("author", info.author_name, info.author_email, ctx.markers, sha) + (
+        identity.check_identity("committer", info.committer_name, info.committer_email, ctx.markers, sha)
     )
 
 
@@ -271,23 +279,16 @@ def _annotated_tags(ctx: Context, commits: set[str]) -> list[TagInfo]:
     return tags
 
 
-def _identity_checks(ctx: Context, commits: list[str]) -> list[Finding]:
+def _identity_checks(
+    ctx: Context, commits: list[str], infos: dict[str, gitutil.CommitInfo] | None = None
+) -> list[Finding]:
     found: list[Finding] = []
+    infos = gitutil.commit_infos(commits, ctx.repo) if infos is None else infos
     for sha in commits:
-        found += _commit_identity(ctx, sha)
+        found += _commit_identity(ctx, infos[sha])
     for tag in _annotated_tags(ctx, set(commits)):
         found += identity.check_identity("tagger", tag.tagger_name, tag.tagger_email, ctx.markers, tag.sha)
     return found
-
-
-def _changed_entries(ctx: Context, sha: str) -> list[gitutil.Entry]:
-    """Added or modified entries of ``sha`` against each parent (merges via ``-m``); deletions excluded."""
-    raw = gitutil.git(
-        ["diff-tree", "-m", "-r", "--root", "--no-commit-id", "--raw", "-z", "--no-abbrev",
-         "--no-renames", "--no-ext-diff", "--diff-filter=d", sha],
-        ctx.repo,
-    )  # fmt: skip
-    return gitutil.parse_raw_z(raw)
 
 
 def range_checks(
@@ -311,7 +312,8 @@ def range_checks(
     else only on the trees of ``policy_tips`` (history: an old version that a
     later commit fixed is not judged by today's policy).
     """
-    found = _identity_checks(ctx, commits)
+    infos = gitutil.commit_infos(commits, ctx.repo)
+    found = _identity_checks(ctx, commits, infos)
     batch: list[tuple[int, int, str, str | None]] = []  # (first line, n lines, path, commit)
     chunks: list[bytes] = []
     cursor = 1
@@ -327,11 +329,12 @@ def range_checks(
     seen: dict[tuple[str, str], str] = {}  # (path, blob sha) -> commit
     links: dict[str, str] = {}  # gitlink path -> commit
     for sha in commits:
-        raw = gitutil.git(["log", "-1", "--format=%B", sha, "--"], ctx.repo)
+        raw = infos[sha].message
         found += messages.check_message(_decode(raw), ":message", ctx.markers, commit=sha, check_format=check_format)
         queue(raw, ":message", sha)
+    changed = gitutil.changed_entries(commits, ctx.repo)
     for sha in reversed(commits):  # oldest first, so a blob is attributed to the commit that added it
-        for entry in _changed_entries(ctx, sha):
+        for entry in changed[sha]:
             if entry.gitlink:
                 links.setdefault(entry.path, sha)
             else:
@@ -375,16 +378,9 @@ def _main_ref(remote: str) -> str:
     return f"refs/remotes/{remote}/main"
 
 
-def _range_commits(ctx: Context, remote: str, base: str | None, tip: str) -> list[str]:
-    """Commits in ``base..tip``; with no base, ``tip`` minus what ``<remote>/main`` already has.
-
-    Only ``refs/remotes/<remote>/main`` is excluded: any other remote-tracking
-    ref (even a forged one) could otherwise hide commits from the scan.
-    """
-    if base is not None:
-        return gitutil.rev_list(["--topo-order", f"{base}..{tip}"], ctx.repo)
-    main = gitutil.resolve_ref(_main_ref(remote), ctx.repo)
-    return _commits_not_in(ctx, tip, main)
+def _range_commits(ctx: Context, base: str, tip: str) -> list[str]:
+    """Commits in ``base..tip`` (merges included)."""
+    return gitutil.rev_list(["--topo-order", f"{base}..{tip}"], ctx.repo)
 
 
 def _commits_not_in(ctx: Context, tip: str, exclude: str | None) -> list[str]:
@@ -392,12 +388,9 @@ def _commits_not_in(ctx: Context, tip: str, exclude: str | None) -> list[str]:
     return gitutil.rev_list(["--topo-order", *spec], ctx.repo)
 
 
-def _range_configs(ctx: Context, remote: str, base: str | None, tip: str) -> list[bytes]:
-    """Tip config, plus the base one (remote sha, or merge-base with ``<remote>/main``) when it differs."""
+def _range_configs(ctx: Context, base: str, tip: str) -> list[bytes]:
+    """Tip config, plus the base commit's one when it differs."""
     candidate = gl_mod.config_bytes(ctx.repo, tip)
-    if base is None:
-        main = gitutil.resolve_ref(_main_ref(remote), ctx.repo)
-        base = gitutil.merge_base(main, tip, ctx.repo) if main else None
     return gl_mod.configs(candidate, gl_mod.base_config(ctx.repo, base))
 
 
@@ -408,12 +401,23 @@ def _remote(name: str) -> str:
 
 
 def mode_range(ctx: Context, remote: str, base: str, tip: str) -> list[Finding]:
+    """``base..tip``; a zero ``base`` is a new branch, scoped exactly like ``prepush``.
+
+    With a zero base the remote's ``main`` comes from ``ls-remote`` (the push
+    URL rules of :func:`_push_target`), never from the local tracking ref
+    ``refs/remotes/<remote>/main``: anyone can ``update-ref`` that one to hide
+    commits from a manual check.
+    """
     remote = _remote(remote)
     gl = Gitleaks(ctx.repo)
     tip_sha = gitutil.resolve_commit(tip, ctx.repo)
-    base_sha = None if gitutil.ZERO_SHA_RE.match(base) else gitutil.resolve_commit(base, ctx.repo)
-    commits = _range_commits(ctx, remote, base_sha, tip_sha)
-    cfgs = _range_configs(ctx, remote, base_sha, tip_sha)
+    if gitutil.ZERO_SHA_RE.match(base):
+        main = _remote_main(ctx, _push_target(ctx, remote))
+        commits, cfgs = _new_branch_scope(ctx, main, tip_sha)
+    else:
+        base_sha = gitutil.resolve_commit(base, ctx.repo)
+        commits = _range_commits(ctx, base_sha, tip_sha)
+        cfgs = _range_configs(ctx, base_sha, tip_sha)
     return range_checks(ctx, gl, commits, cfgs, tip_sha, check_format=True)
 
 
@@ -429,6 +433,10 @@ def mode_history(ctx: Context) -> list[Finding]:
     write their own); message leak rules still run. A repository with no
     commits has no history: only the binary and ``.gitleaksignore`` checks
     run, and the result is clean.
+
+    With ``CI=true`` a missing ``refs/remotes/origin/main`` is rc 2: in CI the
+    union with the published config must never degrade silently (a checkout
+    without ``fetch-depth: 0`` would lose it). Locally the ref is optional.
     """
     gl = Gitleaks(ctx.repo)
     commits = gitutil.rev_list(["--topo-order", "--all"], ctx.repo)
@@ -439,6 +447,11 @@ def mode_history(ctx: Context) -> list[Finding]:
     except GuardError:
         raise GuardError("HEAD does not point at a commit: check out a branch first") from None
     origin_main = gitutil.resolve_ref(_main_ref(HISTORY_REMOTE), ctx.repo)
+    if origin_main is None and os.environ.get("CI", "") == "true":
+        raise GuardError(
+            "CI: refs/remotes/origin/main is missing, so the published config cannot be united "
+            "(check out with fetch-depth: 0)"
+        )
     cfgs = gl_mod.configs(gl_mod.config_bytes(ctx.repo, tip), gl_mod.base_config(ctx.repo, origin_main))
     return range_checks(ctx, gl, commits, cfgs, tip, check_format=False, policy_tips=gitutil.ref_tips(ctx.repo))
 
@@ -481,22 +494,54 @@ def mode_prepush(ctx: Context, remote: str, stdin: bytes) -> list[Finding]:
         remote_main: list[str | None] = []  # ls-remote once, only when a new branch needs it
         for local_sha, remote_sha in updates:
             if remote_sha:
-                commits = _range_commits(ctx, remote, remote_sha, local_sha)
-                cfgs = _range_configs(ctx, remote, remote_sha, local_sha)
+                commits = _range_commits(ctx, remote_sha, local_sha)
+                cfgs = _range_configs(ctx, remote_sha, local_sha)
             else:
                 if not remote_main:
-                    remote_main.append(_remote_main(ctx, remote))
+                    remote_main.append(_remote_main(ctx, _push_target(ctx, remote)))
                 commits, cfgs = _new_branch_scope(ctx, remote_main[0], local_sha)
             found += range_checks(ctx, gl, commits, cfgs, local_sha, check_format=True)
     return found
 
 
-def _remote_main(ctx: Context, remote: str) -> str | None:
-    """``main`` as the remote has it now (``ls-remote``), never the local tracking ref (forgeable).
+def _push_target(ctx: Context, remote: str) -> str:
+    """What ``ls-remote`` must ask: the location the push really goes to.
 
-    None for an empty remote (bootstrap). A sha this clone does not have is rc 2.
+    * ``PUSH_URL`` set (the pre-push hook passes git's ``$2``): that URL, as
+      long as ``ls-remote`` would read the same place (``url.*.insteadOf``
+      can rewrite read URLs, and a URL that is also a remote's name would be
+      read through that remote); otherwise rc 2.
+    * ``PUSH_URL`` absent (a manual run): the remote name, but only when the
+      remote has exactly one URL and pushes to it (``get-url --push --all``
+      equals ``get-url --all``). ``pushurl``, ``pushInsteadOf`` or several
+      URLs mean the fetch URL does not tell what the push target holds: rc 2.
+
+    The URL is never printed.
     """
-    sha = gitutil.remote_branch(remote, MAIN_REF, ctx.repo)
+    url = os.environ.get(PUSH_URL_ENV, "")
+    if url:
+        gitutil.safe_arg(url, "push URL")
+        if gitutil.read_url(url, ctx.repo) != url:
+            raise GuardError("the push URL is rewritten for reads (url.*.insteadOf): cannot tell what it holds")
+        return url
+    fetch = gitutil.remote_urls(remote, ctx.repo, push=False)
+    push = gitutil.remote_urls(remote, ctx.repo, push=True)
+    if len(fetch) != 1 or push != fetch:
+        raise GuardError(
+            "the remote pushes somewhere other than its fetch URL (pushurl, pushInsteadOf or several urls): "
+            "run git push, whose hook passes the push URL"
+        )
+    return remote
+
+
+def _remote_main(ctx: Context, target: str) -> str | None:
+    """``main`` as the push target has it now (``ls-remote``), never the local tracking ref (forgeable).
+
+    None when the remote has no ``main``: an empty remote (bootstrap) or one
+    with other branches only. Every commit of the tip is then scanned, a safe
+    over-scan. A sha this clone does not have is rc 2.
+    """
+    sha = gitutil.remote_branch(target, MAIN_REF, ctx.repo)
     if sha is not None and not gitutil.has_object(sha, ctx.repo):
         raise GuardError("the remote has commits this clone does not: run git fetch first")
     return sha
@@ -505,8 +550,9 @@ def _remote_main(ctx: Context, remote: str) -> str | None:
 def _new_branch_scope(ctx: Context, main: str | None, tip: str) -> tuple[list[str], list[bytes]]:
     """A new branch: commits not on the remote's ``main``, scanned with its config too.
 
-    With an empty remote (bootstrap) every commit is scanned with the
-    candidate config only; that config is lint-frozen.
+    With no ``main`` on the remote (empty, or other branches only) every
+    commit is scanned with the candidate config only; that config is
+    lint-frozen.
     """
     candidate = gl_mod.config_bytes(ctx.repo, tip)
     if main is None:
