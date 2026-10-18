@@ -1,0 +1,49 @@
+name: Feature request
+description: Suggest an improvement or a new capability.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the suggestion. Keep in mind that each level has a fixed scope; ideas are easier to accept when they fit it.
+        Do not include credentials or real personal data.
+  - type: dropdown
+    id: level
+    attributes:
+      label: Level
+      description: Which part of the project would this change?
+      options:
+        - Repository root (Makefile, guards, hooks, CI)
+        - Level 1
+        - Level 2
+        - Level 3
+        - Level 4
+        - Documentation
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What problem would this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What would you like to see?
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and found no duplicate.
+          required: true

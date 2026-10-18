@@ -1,0 +1,64 @@
+name: Bug report
+description: Report something that does not work as documented.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug.
+        Do not paste credentials, tokens, connection strings or real personal data. Use placeholders.
+        For security problems, use private vulnerability reporting instead of this form.
+  - type: dropdown
+    id: level
+    attributes:
+      label: Level
+      description: Which part of the project is affected?
+      options:
+        - Repository root (Makefile, guards, hooks, CI)
+        - Level 1
+        - Level 2
+        - Level 3
+        - Level 4
+        - Documentation
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the problem and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: The exact commands you ran, starting from a clean checkout.
+      placeholder: |
+        1. make setup
+        2. ...
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Operating system, Make, Docker, uv and Python versions.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output
+      description: Paste only the relevant lines, with any secrets or personal data removed.
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I removed all credentials and personal data from this report.
+          required: true
+        - label: This is not a security vulnerability.
+          required: true
