@@ -67,6 +67,7 @@ NOT_IGNORED = [
     "level-1/backend/.env.example",
     ".githooks/pre-commit",
     ".gitleaks.toml",
+    ".guards.toml",
     "tools/guards/uv.lock",
     "tools/guards/pyproject.toml",
     ".github/workflows/guards.yml",
@@ -81,6 +82,9 @@ NOT_IGNORED = [
 @pytest.fixture(scope="module")
 def copy_repo(tmp_path_factory: pytest.TempPathFactory) -> Path:
     repo = git_repo(tmp_path_factory.mktemp("gitignore"))
+    # Only the real .gitignore decides here: drop the default policy and its exclude line.
+    (repo.root / ".guards.toml").unlink()
+    (repo.root / ".git" / "info" / "exclude").unlink()
     repo.write(".gitignore", GITIGNORE.read_bytes())
     return repo.root
 

@@ -44,7 +44,8 @@ from guards.rules.content import (
 
 MAKEFILE_NAMES = frozenset({"Makefile", "makefile", "GNUmakefile"})
 INCLUDE_ENV_RE = re.compile(r"^\s*-?s?include\s+(.*\s)?\S*\.env(\s|$)")
-SECRET_NAME_RE = re.compile(r"(?i)(PASSWORD|SECRET|TOKEN|KEY|DSN)")
+# URL only as a whole ``_``-separated token: DATABASE_URL and URLS yes, CURL no.
+SECRET_NAME_RE = re.compile(r"(?i)(PASSWORD|SECRET|TOKEN|KEY|DSN|(?:^|_)URLS?(?:_|$))")
 GNU_WORD_RE = re.compile(r"\.(ONESHELL|SHELLFLAGS|RECIPEPREFIX)\b")
 GNU_FUNC_RE = re.compile(r"(?<!\$)\$[({](file|let)\s")
 BANG_ASSIGN_RE = re.compile(r"^[^:=!]*[^\s:=!]\s*!=")

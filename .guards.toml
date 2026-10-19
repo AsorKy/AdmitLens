@@ -1,0 +1,15 @@
+# Versioned identity policy for the leak guards (tools/guards, rule identity-owner-name).
+# Public data only. A project reusing this template changes owner_login and owner_name.
+#
+# Every author, committer or tagger whose e-mail is the owner's GitHub noreply address
+# (<digits>+<owner_login>@users.noreply.github.com) must use owner_name, compared without
+# accents or case. Contributors with any other e-mail are not affected.
+#
+# exempt_commits: exact 40-hex commit shas, no patterns. Each one skips identity-owner-name
+# only, and must have an owner-noreply identity (checked by make lint).
+
+[identity]
+owner_login = "AsorKy"
+owner_name = "AsorKy"
+# D-0017: pending history rewrite; remove the entry afterwards.
+exempt_commits = ["905939b59152349d71e27be7250a6f50f02fb2c4"]

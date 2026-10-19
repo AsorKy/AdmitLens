@@ -24,7 +24,7 @@ from pathlib import Path
 from support.fakes import GUARDS_ROOT, NOREPLY_EMAIL, REPO_ROOT, GitRepo, RunResult, msg, run
 
 REAL_GITLEAKS = REPO_ROOT / ".tools" / "bin" / "gitleaks"
-WIRED_FILES = ("Makefile", ".gitleaks.toml", ".gitignore")
+WIRED_FILES = ("Makefile", ".gitleaks.toml", ".gitignore", ".guards.toml")
 HOOKS = ("pre-commit", "commit-msg", "pre-push")
 ZERO = "0" * 40
 # Makefile variables that only a command-line assignment can override.

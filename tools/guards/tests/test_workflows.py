@@ -298,10 +298,11 @@ def test_negative_invalid_yaml():
 
 def test_negative_cli_exit_code(tmp_path):
     """End to end: a bad workflow in a throwaway repo makes `lint` exit 1."""
-    from tests.support.fakes import run
+    from tests.support.fakes import policy_toml, run
 
     repo = tmp_path / "repo"
     (repo / ".github" / "workflows").mkdir(parents=True)
+    (repo / ".guards.toml").write_text(policy_toml())
     (repo / ".github" / "workflows" / "bad.yml").write_text(BASE.format(steps="      - run: echo hi\n"))
     home = tmp_path / "home"
     assert run(["git", "init", "-q"], repo, home=home).rc == 0

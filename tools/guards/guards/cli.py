@@ -26,6 +26,10 @@ Environment:
   only when its push and fetch URLs are one and the same; otherwise rc 2.
 * ``CI=true`` (``history``): ``refs/remotes/origin/main`` must exist, or rc 2.
 
+``history`` on a shallow clone is rc 2 in CI and locally: commits it cannot
+see are commits it cannot scan. ``identity``, ``range``, ``prepush``,
+``history`` and ``lint`` need the versioned ``.guards.toml`` (rc 2 without it).
+
 Arguments and URLs are never echoed back: a usage error only names the mode.
 """
 
@@ -50,6 +54,7 @@ from guards.findings import (
 from guards import gitleaks as gl_mod
 from guards.gitleaks import BlobItem, Gitleaks
 from guards.markers import Markers, load_markers
+from guards.policy import POLICY_FILE, OwnerPolicy, load_policy, parse_policy
 from guards.rules import content, identity, lint, messages, paths
 
 USAGE = """usage: python -m guards MODE [ARGS]
@@ -58,8 +63,9 @@ modes:
   range <remote> <from> <to>     every commit in from..to (merges included)
   tree                           files that are or could be versioned
   message <file>                 commit or tag message
-  identity <range>               author/committer/tagger of a rev-list range
-  lint                           Makefiles, .gitignore files, workflows
+  identity <range>               author/committer/tagger of a rev-list range; for A..B the
+                                 .guards.toml committed at A also applies (stricter of both)
+  lint                           Makefiles, .gitignore files, workflows, .guards.toml
   prepush <remote>               git pre-push hook (reads refs on stdin)
   history                        all commits on all refs (merges via -m),
                                  commit and annotated-tag messages, identities;
@@ -70,12 +76,30 @@ modes:
 MAIN_REF = "refs/heads/main"
 HISTORY_REMOTE = "origin"
 PUSH_URL_ENV = "PUSH_URL"
+POLICY_MODES = frozenset({"identity", "range", "prepush", "history", "lint"})
+SHALLOW_ERROR = "history needs the full clone (fetch-depth: 0)"
 
 
 @dataclass
 class Context:
     repo: Path
     markers: Markers
+    policy: OwnerPolicy | None = None
+
+
+def _owners(ctx: Context, base: str | None = None) -> list[OwnerPolicy]:
+    """The work-tree policy, plus the one committed at ``base`` when it has one (stricter of both).
+
+    A commit can only be exempt when every policy exempts it, so a branch
+    cannot exempt its own commits by editing ``.guards.toml``: the published
+    base still flags them.
+    """
+    owners = [] if ctx.policy is None else [ctx.policy]
+    if base is not None:
+        data = gitutil.blob(f"{base}:{POLICY_FILE}", ctx.repo)
+        if data is not None:
+            owners.append(parse_policy(data, f"{POLICY_FILE} at the base commit"))
+    return owners
 
 
 def _decode(data: bytes) -> str:
@@ -200,8 +224,36 @@ def mode_tree(ctx: Context) -> list[Finding]:
     return found
 
 
+def policy_lint(ctx: Context) -> list[Finding]:
+    """``guards-config-exempt``: an exempted sha that exists here but has no owner-noreply identity.
+
+    The exemption only ever skips ``identity-owner-name``, which only fires
+    on the owner's address, so listing any other commit is a mistake or an
+    attempt to hide something; either way it is a finding.
+    """
+    policy = ctx.policy
+    if policy is None:
+        raise GuardError(f"{POLICY_FILE} is missing (required: owner identity policy)")
+    present = sorted(sha for sha in policy.exempt_commits if gitutil.has_object(sha, ctx.repo))
+    missing = len(policy.exempt_commits) - len(present)
+    if missing:
+        # A warning, not a finding: after the history rewrite the entry is dead and should go.
+        print(
+            f"guards lint: warn {POLICY_FILE}: {missing} exempt_commits sha(s) not in this clone "
+            "(remove them once the history rewrite is published)",
+            file=sys.stderr,
+        )
+    infos = gitutil.commit_infos(present, ctx.repo) if present else {}
+    found = []
+    for sha in present:
+        info = infos[sha]
+        if not (policy.owns(info.author_email) or policy.owns(info.committer_email)):
+            found.append(Finding("guards-config-exempt", POLICY_FILE, 0, sha))
+    return found
+
+
 def mode_lint(ctx: Context) -> list[Finding]:
-    found: list[Finding] = []
+    found: list[Finding] = policy_lint(ctx)
     for rel in candidate_files(ctx.repo):
         if not lint.is_lint_target(rel):
             continue
@@ -243,10 +295,12 @@ def mode_message(ctx: Context, file: str) -> list[Finding]:
 # --------------------------------------------------------------------------- history
 
 
-def _commit_identity(ctx: Context, info: gitutil.CommitInfo) -> list[Finding]:
+def _commit_identity(ctx: Context, info: gitutil.CommitInfo, owners: list[OwnerPolicy]) -> list[Finding]:
     sha = info.sha
-    return identity.check_identity("author", info.author_name, info.author_email, ctx.markers, sha) + (
-        identity.check_identity("committer", info.committer_name, info.committer_email, ctx.markers, sha)
+    return identity.check_identity(
+        "author", info.author_name, info.author_email, ctx.markers, sha, owners=owners
+    ) + identity.check_identity(
+        "committer", info.committer_name, info.committer_email, ctx.markers, sha, owners=owners
     )
 
 
@@ -280,14 +334,19 @@ def _annotated_tags(ctx: Context, commits: set[str]) -> list[TagInfo]:
 
 
 def _identity_checks(
-    ctx: Context, commits: list[str], infos: dict[str, gitutil.CommitInfo] | None = None
+    ctx: Context,
+    commits: list[str],
+    owners: list[OwnerPolicy],
+    infos: dict[str, gitutil.CommitInfo] | None = None,
 ) -> list[Finding]:
     found: list[Finding] = []
     infos = gitutil.commit_infos(commits, ctx.repo) if infos is None else infos
     for sha in commits:
-        found += _commit_identity(ctx, infos[sha])
+        found += _commit_identity(ctx, infos[sha], owners)
     for tag in _annotated_tags(ctx, set(commits)):
-        found += identity.check_identity("tagger", tag.tagger_name, tag.tagger_email, ctx.markers, tag.sha)
+        found += identity.check_identity(
+            "tagger", tag.tagger_name, tag.tagger_email, ctx.markers, tag.sha, owners=owners
+        )
     return found
 
 
@@ -300,6 +359,7 @@ def range_checks(
     *,
     check_format: bool,
     policy_tips: list[str] | None = None,
+    owners: list[OwnerPolicy] | None = None,
 ) -> list[Finding]:
     """Identities, messages (format only when ``check_format``) and every file version in ``commits``.
 
@@ -311,9 +371,10 @@ def range_checks(
     ``policy_tips`` is None (range, prepush: everything in the range is new),
     else only on the trees of ``policy_tips`` (history: an old version that a
     later commit fixed is not judged by today's policy).
+    ``owners`` defaults to the work-tree ``.guards.toml`` alone.
     """
     infos = gitutil.commit_infos(commits, ctx.repo)
-    found = _identity_checks(ctx, commits, infos)
+    found = _identity_checks(ctx, commits, _owners(ctx) if owners is None else owners, infos)
     batch: list[tuple[int, int, str, str | None]] = []  # (first line, n lines, path, commit)
     chunks: list[bytes] = []
     cursor = 1
@@ -414,11 +475,13 @@ def mode_range(ctx: Context, remote: str, base: str, tip: str) -> list[Finding]:
     if gitutil.ZERO_SHA_RE.match(base):
         main = _remote_main(ctx, _push_target(ctx, remote))
         commits, cfgs = _new_branch_scope(ctx, main, tip_sha)
+        owners = _owners(ctx, main)
     else:
         base_sha = gitutil.resolve_commit(base, ctx.repo)
         commits = _range_commits(ctx, base_sha, tip_sha)
         cfgs = _range_configs(ctx, base_sha, tip_sha)
-    return range_checks(ctx, gl, commits, cfgs, tip_sha, check_format=True)
+        owners = _owners(ctx, base_sha)
+    return range_checks(ctx, gl, commits, cfgs, tip_sha, check_format=True, owners=owners)
 
 
 def mode_history(ctx: Context) -> list[Finding]:
@@ -438,6 +501,8 @@ def mode_history(ctx: Context) -> list[Finding]:
     union with the published config must never degrade silently (a checkout
     without ``fetch-depth: 0`` would lose it). Locally the ref is optional.
     """
+    if gitutil.git(["rev-parse", "--is-shallow-repository"], ctx.repo).strip() != b"false":
+        raise GuardError(SHALLOW_ERROR)
     gl = Gitleaks(ctx.repo)
     commits = gitutil.rev_list(["--topo-order", "--all"], ctx.repo)
     if not commits:
@@ -453,13 +518,29 @@ def mode_history(ctx: Context) -> list[Finding]:
             "(check out with fetch-depth: 0)"
         )
     cfgs = gl_mod.configs(gl_mod.config_bytes(ctx.repo, tip), gl_mod.base_config(ctx.repo, origin_main))
-    return range_checks(ctx, gl, commits, cfgs, tip, check_format=False, policy_tips=gitutil.ref_tips(ctx.repo))
+    return range_checks(
+        ctx, gl, commits, cfgs, tip, check_format=False, policy_tips=gitutil.ref_tips(ctx.repo),
+        owners=_owners(ctx, origin_main),
+    )
+
+
+def _range_base(ctx: Context, rng: str) -> str | None:
+    """The base of an ``A..B`` spec (``..B`` means ``HEAD..B``); None for any other spec.
+
+    ``A...B`` (symmetric difference) and single revisions have no base: only
+    the work-tree policy applies to them.
+    """
+    if "..." in rng or ".." not in rng:
+        return None
+    left = rng.split("..", 1)[0] or "HEAD"
+    return gitutil.resolve_commit(left, ctx.repo)
 
 
 def mode_identity(ctx: Context, rng: str) -> list[Finding]:
+    """Identities of ``rng``; an ``A..B`` range also applies the policy committed at ``A``."""
     gitutil.safe_arg(rng, "range")
     commits = gitutil.rev_list(["--end-of-options", rng], ctx.repo)
-    return _identity_checks(ctx, commits)
+    return _identity_checks(ctx, commits, _owners(ctx, _range_base(ctx, rng)))
 
 
 def mode_prepush(ctx: Context, remote: str, stdin: bytes) -> list[Finding]:
@@ -496,11 +577,13 @@ def mode_prepush(ctx: Context, remote: str, stdin: bytes) -> list[Finding]:
             if remote_sha:
                 commits = _range_commits(ctx, remote_sha, local_sha)
                 cfgs = _range_configs(ctx, remote_sha, local_sha)
+                owners = _owners(ctx, remote_sha)
             else:
                 if not remote_main:
                     remote_main.append(_remote_main(ctx, _push_target(ctx, remote)))
                 commits, cfgs = _new_branch_scope(ctx, remote_main[0], local_sha)
-            found += range_checks(ctx, gl, commits, cfgs, local_sha, check_format=True)
+                owners = _owners(ctx, remote_main[0])
+            found += range_checks(ctx, gl, commits, cfgs, local_sha, check_format=True, owners=owners)
     return found
 
 
@@ -576,7 +659,7 @@ def _dispatch(argv: Sequence[str], stdin: Callable[[], bytes]) -> tuple[str, lis
     if len(args) != arity[mode]:
         raise GuardError(f"wrong number of arguments for {mode}")
     repo = gitutil.toplevel(Path.cwd())
-    ctx = Context(repo, load_markers(repo))
+    ctx = Context(repo, load_markers(repo), load_policy(repo) if mode in POLICY_MODES else None)
     if mode == "staged":
         return mode, mode_staged(ctx)
     if mode == "tree":

@@ -2,8 +2,9 @@
 
 The first meaningful line must follow the project format, or be a git-made
 ``Merge …`` / ``Revert "…"`` line. Every line is then checked for AI trailers,
-``claude.ai`` URLs, local home paths, non-allowlisted e-mails and private
-markers. Secret-shaped content in messages is gitleaks' job (``gitleaks stdin``).
+``claude.ai`` URLs, local home paths, non-allowlisted e-mails, private
+markers and CI-skip instructions (``[skip ci]`` and its aliases, or a
+``skip-checks: true`` trailer: ``msg-skip-ci``). Secret-shaped content in messages is gitleaks' job (``gitleaks stdin``).
 
 One exact line is exempt from ``msg-email``: Dependabot's standard sign-off
 trailer, :data:`DEPENDABOT_SIGNOFF`. The whole line, after line splitting, must
@@ -37,6 +38,10 @@ GIT_MADE_RE = re.compile(r'^(Merge |Revert ")')
 COAUTHOR_RE = re.compile(r"(?i)^\s*co-authored-by:.*@([a-z0-9-]+\.)*anthropic\.com\b")
 SESSION_RE = re.compile(r"(?i)^\s*claude-session:")
 LOCAL_PATH_RE = re.compile(r"(?:/Users|/home)/[^/\s]+/")
+# GitHub Actions skips push and pull_request workflows for these (docs: "Skipping
+# workflow runs"); a public repo must never land a commit that dodged CI.
+SKIP_CI_RE = re.compile(r"(?i)\[(?:skip ci|ci skip|no ci|skip actions|actions skip)\]")
+SKIP_CHECKS_RE = re.compile(r"(?i)^\s*skip-checks\s*:\s*true\s*$")
 DEPENDABOT_SIGNOFF = "Signed-off-by: dependabot[bot] <" + "support" + "@" + "github.com" + ">"
 
 
@@ -85,4 +90,6 @@ def check_message(
             add("msg-email", no)
         if markers.any_hit(line):
             add("msg-private-marker", no)
+        if SKIP_CI_RE.search(line) or SKIP_CHECKS_RE.match(line):
+            add("msg-skip-ci", no)
     return found

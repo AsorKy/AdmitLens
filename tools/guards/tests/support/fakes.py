@@ -39,6 +39,10 @@ _B32 = string.ascii_uppercase + "234567"
 FORBIDDEN_GIT_VARS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE")
 
 NOREPLY_EMAIL = "1000+dev@users.noreply.github.com"
+# The policy every throwaway repo gets (``.guards.toml``): a public test alias.
+OWNER_LOGIN = "octo-owner"
+OWNER_NAME = "Octo Alias"
+OWNER_NOREPLY = "4242+" + OWNER_LOGIN + "@users.noreply.github.com"
 
 
 def fingerprint(value: str) -> str:
@@ -273,6 +277,27 @@ def add_real_gitignore(repo: GitRepo) -> str:
     return ".gitignore"
 
 
+def policy_toml(
+    login: str = OWNER_LOGIN, name: str = OWNER_NAME, exempt: tuple[str, ...] = ()
+) -> str:
+    items = ", ".join(f'"{sha}"' for sha in exempt)
+    return f'[identity]\nowner_login = "{login}"\nowner_name = "{name}"\nexempt_commits = [{items}]\n'
+
+
+def add_policy(repo: GitRepo, text: str | None = None, *, exclude: bool = True) -> str:
+    """Write ``.guards.toml`` (default policy); ``exclude`` keeps it out of scans and status."""
+    repo.write(".guards.toml", policy_toml() if text is None else text)
+    if exclude:
+        info = repo.root / ".git" / "info"
+        info.mkdir(exist_ok=True)
+        exclude_file = info / "exclude"
+        lines = exclude_file.read_text(encoding="utf-8").splitlines() if exclude_file.exists() else []
+        if "/.guards.toml" not in lines:
+            with exclude_file.open("a", encoding="utf-8") as fh:
+                fh.write("/.guards.toml\n")
+    return ".guards.toml"
+
+
 def git_repo(tmp_path: Path, name: str = "repo") -> GitRepo:
     root = tmp_path / name
     root.mkdir()
@@ -282,6 +307,7 @@ def git_repo(tmp_path: Path, name: str = "repo") -> GitRepo:
     repo.git("config", "user.email", NOREPLY_EMAIL)
     repo.git("config", "commit.gpgsign", "false")
     repo.git("config", "tag.gpgsign", "false")
+    add_policy(repo)
     return repo
 
 

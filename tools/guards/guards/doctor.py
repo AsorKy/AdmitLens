@@ -19,6 +19,9 @@ What each check protects (PLAN-CA-0005 §6.4, "Configuración de git"):
   real name from ``.guards.local.toml``. An absent ``.guards.local.toml`` is a
   warning (CI has none); so is an empty ``real_names``: an operator who stays
   anonymous behind a public alias has no real name to protect (D-0012).
+* ``.guards.toml`` parses, and when ``user.email`` is the owner's noreply
+  address ``user.name`` is the owner's public alias (``identity-owner-name``,
+  compared without accents or case; the exemptions never apply locally).
 """
 
 from __future__ import annotations
@@ -33,6 +36,7 @@ from guards import gitutil
 from guards.findings import EXIT_CLEAN, EXIT_FINDINGS, GuardError
 from guards.gitleaks import BINARY_ENV, PINNED_VERSION, binary_ok, ensure_no_gitleaksignore
 from guards.markers import MARKERS_FILE, load_markers
+from guards.policy import POLICY_FILE, load_policy
 from guards.rules.identity import NOREPLY_SUFFIX
 
 HOOKS_DIR = ".githooks"
@@ -131,6 +135,16 @@ def checks(repo: Path) -> list[tuple[str, str]]:
         out.append(("FAIL", "user.name is not a private real name"))
     else:
         out.append(("ok", "user.name is not a private real name"))
+
+    try:
+        policy = load_policy(repo)
+    except GuardError:
+        out.append(("FAIL", f"{POLICY_FILE} present and valid"))
+        policy = None
+    if policy is not None:
+        out.append(("ok", f"{POLICY_FILE} present and valid"))
+        owner_ok = not (policy.owns(email) and not policy.name_ok(name))
+        out.append(("ok" if owner_ok else "FAIL", "user.name is the owner alias for the owner noreply address"))
 
     for tool in OPTIONAL_TOOLS:
         out.append(("ok" if shutil.which(tool) else "warn", f"{tool} installed (optional)"))
